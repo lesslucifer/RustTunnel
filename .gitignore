@@ -1,3 +1,7 @@
 /target
 .claude/settings.local.json
 .DS_Store
+
+# Captured run output stays local. The ledger explaining what to capture does not.
+/evidence/*
+!/evidence/README.md
