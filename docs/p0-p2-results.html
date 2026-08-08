@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en" data-htmldoc-id="6a7718849f34851f0dfab20c">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RustTunnel — P0–P2 Result Report</title>
+</head>
+<body>
+  <header class="doc-hero">
+    <div class="inner">
+      <h1>RustTunnel — P0–P2 Result Report</h1>
+      <p>What was built, what was proven against a real network, and the one thing that is still unproven — which happens to be the thing the whole design rests on.</p>
+      <div class="meta">Draft v1 · 2026-08-08 · RustTunnel</div>
+    </div>
+  </header>
+
+  <main>
+
+  <h2 id="verdict">Verdict</h2>
+
+  <div class="callout warn" data-c="verdict-callout">
+    <strong>Five of eight tasks are done. The risk gate is not one of them.</strong> Everything that can be proven on one machine has been proven and filed. <a href="wbs.html#p2">2.2 — cross-NAT direct connection</a> cannot be run here at all: both roles share one Wi-Fi interface, and loopback has nothing to traverse. Until 2.2 reports <code>path=direct</code> across two genuinely different networks, the premise of <a href="implementation-plan.html#pivot">v2</a> is untested. <strong>Do not start P3.</strong>
+  </div>
+
+  <div class="cards" data-c="verdict-cards">
+    <div class="card">
+      <h3>Proven</h3>
+      <p>The binary builds and runs. Identity persists and is owner-only. The wrong key is turned away. The path is reported and upgrades. The relayed fallback holds a link for five minutes without dropping.</p>
+    </div>
+    <div class="card">
+      <h3>Not proven</h3>
+      <p>That a hole punch survives two real NATs. That the three-platform build is green on Linux and Windows. That a second machine can dial in.</p>
+    </div>
+    <div class="card">
+      <h3>Not built, by design</h3>
+      <p>No data plane. No TCP or UDP forwarding, no reconnect, no service units. P0–P2 exists to answer "is this possible" before any of that is worth writing.</p>
+    </div>
+  </div>
+
+  <h2 id="status">Task status</h2>
+
+  <div class="diagram" data-c="diag-status">
+    <pre class="mermaid">
+flowchart TD
+  P0["P0 · Foundation<br/>0.1 done · 0.2 blocked"]
+  P1["P1 · Identity<br/>1.1 done · 1.3 done<br/>1.2 partial"]
+  P2["P2 · Direct path<br/>2.1 done · 2.3 done"]
+  GATE{"2.2 cross-NAT<br/>NOT RUN"}
+  P3["P3 · TCP forwarding"]
+  STOP["Premise untested.<br/>Do not build a data plane<br/>on an assumption."]
+  P0 --> P1 --> P2 --> GATE
+  GATE -.->|"needs two real networks"| STOP
+  GATE -->|"only once path=direct<br/>on both sides"| P3
+    </pre>
+    <div class="caption">Hình 1 — The dotted edge is where the project currently sits. P3 is unreachable until 2.2 answers.</div>
+  </div>
+
+  <table data-c="status-table">
+    <thead><tr><th></th><th>Task</th><th>Result</th><th>What was observed</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">0.1</span></td>
+        <td>Repo skeleton and toolchain</td>
+        <td><span class="badge auto">done</span></td>
+        <td>Release build on rustc 1.95.0, a 13.2 MB binary, all four help outputs, both in-process checks green.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">0.2</span></td>
+        <td>Three-platform CI</td>
+        <td><span class="badge approval">blocked</span></td>
+        <td>The workflow exists and covers all three runners. No git remote to push to, so no run has ever executed.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">1.1</span></td>
+        <td>Persistent identity</td>
+        <td><span class="badge auto">done</span></td>
+        <td>Same id across two processes; key <code>-rw-------</code>, dir <code>drwx------</code>; a different id after wiping the state dir.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">1.2</span></td>
+        <td>Dial by endpoint ID</td>
+        <td><span class="badge approval">partial</span></td>
+        <td>Connection established from id alone; each side logged the other's id, matching what <code>rtun id</code> printed. Both roles were on <em>one</em> machine.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">1.3</span></td>
+        <td>Peer allowlist</td>
+        <td><span class="badge auto">done</span></td>
+        <td>Unlisted key refused, rejection line names the full key, dialer saw <code>closed by peer: not in --allow (code 1)</code>. Same key admitted after adding it.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">2.1</span></td>
+        <td>Path reporting</td>
+        <td><span class="badge auto">done</span></td>
+        <td>Both sides logged <code>path=relayed</code> on establishment and <code>path=direct</code> on upgrade, independently.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">2.2</span></td>
+        <td><strong>Cross-NAT direct connection</strong></td>
+        <td><span class="badge approval">not run</span></td>
+        <td>Nothing. Requires a second network. See <a href="#gate">the gate</a>.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">2.3</span></td>
+        <td>Relay fallback works</td>
+        <td><span class="badge auto">done</span></td>
+        <td><code>path=relayed</code> held for 5 m 44 s across a 5-minute heartbeat window, both processes alive at the end, no drop.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="built">What was built</h2>
+
+  <p>374 lines of Rust across three files, following the <a href="implementation-plan.html#layout">planned layout</a> minus <code>proto.rs</code> — there is no framing to hold until P3 defines it.</p>
+
+  <table data-c="built-table">
+    <thead><tr><th>File</th><th>Lines</th><th>Holds</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/main.rs</code></td><td>261</td><td>clap surface, key persistence, endpoint builder, path reporting</td></tr>
+      <tr><td><code>src/serve.rs</code></td><td>92</td><td>accept loop, allowlist check, and the one authorization test</td></tr>
+      <tr><td><code>src/connect.rs</code></td><td>21</td><td>dial by id, hold the link</td></tr>
+      <tr><td><code>.github/workflows/ci.yml</code></td><td>24</td><td>build and test on three runners</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout" data-c="deps-callout">
+    <strong>Two dependencies beyond the plan's list.</strong> <code>tokio-stream</code> because <code>path_events()</code> returns a bare <code>Stream</code> and needs a <code>StreamExt</code> to poll — it was already in the tree transitively via iroh, so it costs no extra compilation. <code>anyhow</code> for error context on the CLI paths. Everything else is <a href="implementation-plan.html#deps">as specified</a>.
+  </div>
+
+  <h2 id="drift">Where the plan's iroh sketch had drifted</h2>
+
+  <p>The plan flagged its own API sketch as <a href="implementation-plan.html#deps">illustrative rather than compiled</a>, and it was right to. Three things differ in the released 1.0.3.</p>
+
+  <table data-c="drift-table">
+    <thead><tr><th>The plan expected</th><th>1.0.3 actually has</th><th>Consequence</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>A connection-type accessor to log direct vs relayed</td>
+        <td>No <code>conn_type</code> at all. Path state is <code>Connection::paths()</code> for a snapshot plus a <code>path_events()</code> stream of <code>PathEvent::{Opened, Closed, Selected, Lagged}</code>.</td>
+        <td>Path reporting reads <code>TransportAddr::is_relay()</code> off the <em>selected</em> path. Richer than expected — the address and RTT come along for free.</td>
+      </tr>
+      <tr>
+        <td>A relay mode to force the relayed path for 2.3</td>
+        <td><code>Builder::clear_ip_transports()</code>. <code>RelayMode</code> exists but selects <em>which</em> relay, not whether direct paths are allowed.</td>
+        <td><code>--relay-only</code> drops the IP transports, so no direct path can ever be selected. Stronger than a preference — it is structural.</td>
+      </tr>
+      <tr>
+        <td><code>Endpoint::connect(endpoint_id, …)</code></td>
+        <td>Same shape; <code>EndpointId</code> converts into <code>EndpointAddr</code>, and discovery fills in the addresses.</td>
+        <td>None. The four-line sketch compiled essentially as written.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="numbers">The numbers that matter</h2>
+
+  <p>Establishment is relayed and migrates once the punch validates — this is <a href="implementation-plan.html#establishment">Hình 3</a> behaving as designed, not a failure. The WBS phrases 2.1 as "reports direct immediately"; what actually happens is a relayed establishment followed by an upgrade, both logged.</p>
+
+  <div class="diagram" data-c="diag-observed">
+    <pre class="mermaid">
+sequenceDiagram
+  participant C as rtun connect
+  participant R as n0 relay aps1-1
+  participant S as rtun serve
+  C->>R: dial by endpoint id
+  R->>S: forwarded
+  S-->>C: established, path=relayed, rtt 120-401 ms
+  Note over C,S: allowlist check passes on the serve side
+  par punch, concurrent with the live connection
+    C->>S: probe candidates directly
+  and
+    S->>C: probe candidates directly
+  end
+  Note over C,S: path selected, path=direct, rtt ~1.2 ms
+  Note over R: relay leaves the data path
+    </pre>
+    <div class="caption">Hình 2 — Measured, not sketched. Every figure below is read off a filed log.</div>
+  </div>
+
+  <table data-c="numbers-table">
+    <thead><tr><th>Measurement</th><th>Observed</th><th>Reading</th></tr></thead>
+    <tbody>
+      <tr><td>Upgrade latency, established → <code>path=direct</code></td><td>67 – 410 ms across four runs</td><td>Fast enough that the relayed window is invisible to a user, and it is logged either way.</td></tr>
+      <tr><td>RTT, relayed</td><td>120 – 401 ms on establishment; up to 2.08 s under the held relay</td><td>The cost v1 paid on every byte.</td></tr>
+      <tr><td>RTT, direct</td><td>1.15 – 1.24 ms</td><td>The latency argument that motivated the pivot, visible in one log line.</td></tr>
+      <tr><td>Relayed hold, <code>--relay-only</code></td><td>5 m 44 s, six heartbeats, no drop</td><td>The fallback is real, not theoretical.</td></tr>
+      <tr><td>Allowlist rejection</td><td>~50 ms after handshake</td><td>Refused on the key the handshake revealed, before anything else happens.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout" data-c="heartbeat-callout">
+    <strong>Why the path is restated once a minute.</strong> 2.3 asks for <code>path=relayed</code> at <em>both ends</em> of a five-minute window. A single establishment line plus the absence of an upgrade event would have been an inference, not evidence — it asks the reader to trust that a missing log line means nothing changed. A per-minute <code>still up path=…</code> line makes the claim directly readable, and it is what <a href="wbs.html#p5">5.3's 24-hour soak</a> will need anyway.
+  </div>
+
+  <h2 id="gate">The gate, and what it needs</h2>
+
+  <p>This is the only outstanding item that can change the design rather than merely delay it.</p>
+
+  <pre><code># home box, on the home ISP
+rtun id                                   # -> ID_HOME
+rtun serve --tcp 22 --allow $ID_LAPTOP 2>&1 | tee serve.log
+
+# laptop, tethered to a phone on cellular — NOT the home Wi-Fi
+rtun id                                   # -> ID_LAPTOP
+rtun connect $ID_HOME --tcp 2222:22 2>&1 | tee connect.log</code></pre>
+
+  <p>Pass condition: <strong>both</strong> logs independently reach a <code>path selected … path=direct</code> line. The <code>path=relayed</code> establishment line before it is expected — wait for the upgrade.</p>
+
+  <div class="callout warn" data-c="gate-callout">
+    <strong>If it stays relayed on both sides, stop.</strong> Try a third network before concluding anything — one symmetric NAT is survivable and two are not. If a third network also fails, hole punching is not available on the networks you have, and the honest options are keeping <a href="implementation-plan.html#pivot">v1's relay design</a> or accepting relayed operation and giving up the latency and bandwidth argument. The numbers in <a href="#numbers">the table above</a> are what that concession costs: roughly 200× the round-trip time.
+  </div>
+
+  <h2 id="checks">How the in-process check was kept honest</h2>
+
+  <p>The <a href="implementation-plan.html#testing">plan's one check</a> lists five cases; three of them exercise forwarding that does not exist yet. Two are live:</p>
+
+  <table data-c="checks-table">
+    <thead><tr><th>Check</th><th>Covers</th></tr></thead>
+    <tbody>
+      <tr><td><code>allowlist_admits_only_listed_peers</code></td><td>An unlisted key is refused and a listed one is admitted — one of the two authorization cases the plan says earn their place, because a regression there is an open door rather than a broken feature.</td></tr>
+      <tr><td><code>port_map_parses_and_rejects_junk</code></td><td>The <code>local:remote</code> parser, including port zero, out-of-range and missing halves.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout" data-c="offline-callout">
+    <strong>Both checks are fully offline.</strong> They bind <code>127.0.0.1:0</code> with iroh's <code>presets::Minimal</code> — no relay, no discovery, no DNS. The suite runs in about two seconds and the CI runners need no egress, which removes the most common source of a flaky cross-platform job before the job has ever run.
+  </div>
+
+  <h2 id="next">What to do next</h2>
+
+  <table data-c="next-table">
+    <thead><tr><th></th><th>Action</th><th>Unblocks</th></tr></thead>
+    <tbody>
+      <tr><td><span class="badge id">1</span></td><td>Run 2.2 across two real networks.</td><td>Everything. This is the gate.</td></tr>
+      <tr><td><span class="badge id">2</span></td><td>Add a git remote and push, so the three-runner CI actually executes.</td><td>0.2, and early warning on Windows and Linux breaks.</td></tr>
+      <tr><td><span class="badge id">3</span></td><td>Re-run 1.2 with the dialer on a second machine.</td><td>1.2. Largely subsumed by 2.2, which needs two machines anyway.</td></tr>
+      <tr><td><span class="badge id">4</span></td><td>Only then, <a href="wbs.html#p3">P3</a>.</td><td>The data plane.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout" data-c="evidence-callout">
+    <strong>On the evidence.</strong> Captured transcripts and logs are kept out of git by request, so they live in <code>evidence/</code> on the build machine only. That is a deliberate departure from <a href="wbs.html#done">the WBS definition of done</a>, which treats a committed artifact as the gate. The tracked <code>evidence/README.md</code> carries the ledger and the procedures for the open tasks; the runs themselves are local and will not survive a fresh clone.
+  </div>
+
+  </main>
+
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    document.querySelectorAll('.diagram').forEach((d) => {
+      const pre = d.querySelector('pre.mermaid');
+      if (pre) d.dataset.mermaidSrc = pre.textContent;
+    });
+    mermaid.initialize({ startOnLoad: true, theme: 'dark', themeVariables: { darkMode: true, background: '#181b22' } });
+  </script>
+  <script type="module" src="https://htmldoc.wfomobile.com/htmldoc.js"></script>
+</body>
+</html>
