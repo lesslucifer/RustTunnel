@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  P6.3, macOS — rtun serve as a user LaunchAgent.
+
+    sed -e "s|__RTUN__|$HOME/.local/bin/rtun|" -e "s|__PEER__|$PEER_ID|" \
+        -e "s|__PORT__|22|" -e "s|__STATE__|$HOME/.local/state/rtun|" \
+        -e "s|__HOME__|$HOME|" packaging/com.rtun.serve.plist \
+        > ~/Library/LaunchAgents/com.rtun.serve.plist
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.rtun.serve.plist
+
+  RunAtLoad starts it at login, KeepAlive restarts it if it ever dies. A LaunchAgent
+  rather than a LaunchDaemon because the key lives in the user's state directory and
+  the forwarded services are the user's own; a daemon would need its own identity.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>            <string>com.rtun.serve</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__RTUN__</string>
+    <string>serve</string>
+    <string>--tcp</string>   <string>__PORT__</string>
+    <string>--allow</string> <string>__PEER__</string>
+  </array>
+  <!-- launchd starts the agent with an almost empty environment, so the state
+       directory is named outright rather than inferred from $HOME. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RTUN_STATE_DIR</key> <string>__STATE__</string>
+  </dict>
+  <key>RunAtLoad</key>        <true/>
+  <key>KeepAlive</key>        <true/>
+  <key>StandardOutPath</key>  <string>__HOME__/Library/Logs/rtun-serve.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/Library/Logs/rtun-serve.log</string>
+</dict>
+</plist>

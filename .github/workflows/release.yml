@@ -1,0 +1,55 @@
+name: release
+
+# P6.1 — a tag push produces one binary per platform, each with a checksum.
+# Hand-written rather than `cargo dist init`: four targets, one archive step and
+# one upload step is less machinery than a generator plus its config, and every
+# line here is one a reader can check against the release page.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest,   target: aarch64-apple-darwin }
+          - { os: macos-latest,   target: x86_64-apple-darwin }
+          # musl, not gnu: a glibc-linked binary inherits the runner's glibc
+          # version and dies with GLIBC_2.x not found on an older box.
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-musl }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          # aarch64-unknown-linux-musl (Raspberry Pi) is one more line plus a
+          # cross linker. Add it when someone actually has the board.
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: archive and checksum
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          if [ "$RUNNER_OS" = Windows ]; then
+            7z a "$GITHUB_WORKSPACE/rtun-${{ matrix.target }}.zip" rtun.exe
+          else
+            tar czf "$GITHUB_WORKSPACE/rtun-${{ matrix.target }}.tar.gz" rtun
+          fi
+          cd "$GITHUB_WORKSPACE"
+          for f in rtun-${{ matrix.target }}.tar.gz rtun-${{ matrix.target }}.zip; do
+            [ -f "$f" ] || continue
+            if command -v shasum >/dev/null; then shasum -a 256 "$f" > "$f.sha256"
+            else sha256sum "$f" > "$f.sha256"; fi
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: rtun-${{ matrix.target }}.*
+          generate_release_notes: true

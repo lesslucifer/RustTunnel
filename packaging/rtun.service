@@ -1,0 +1,24 @@
+# P6.3, Linux — rtun serve under systemd.
+#
+#   sudo cp packaging/rtun.service /etc/systemd/system/
+#   sudoedit /etc/systemd/system/rtun.service      # set --allow and the ports
+#   sudo systemctl enable --now rtun
+#
+# StateDirectory=rtun is what makes DynamicUser workable: systemd hands the unit
+# /var/lib/rtun via $STATE_DIRECTORY, which rtun already reads, so the endpoint
+# identity survives restarts without a real user account owning it.
+
+[Unit]
+Description=rtun — TCP and UDP forwarding over a direct QUIC connection
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/rtun serve --tcp 22 --allow PEER_ENDPOINT_ID
+StateDirectory=rtun
+DynamicUser=yes
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

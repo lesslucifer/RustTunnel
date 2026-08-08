@@ -206,6 +206,27 @@ async fn allowlist_admits_only_listed_peers() {
     );
 }
 
+/// P5.1's other half: a refusal is terminal. Now that `connect` retries a lost
+/// link forever, it must still give up — with an error, so the exit status is
+/// non-zero — when the allowlist turns it away. Otherwise the retry loop hammers
+/// a permanent answer for as long as the process lives.
+#[tokio::test]
+async fn a_refused_connect_gives_up_instead_of_retrying() {
+    let server = local_endpoint(vec![ALPN.to_vec()]).await;
+    let someone_else = local_endpoint(vec![]).await;
+    let stranger = local_endpoint(vec![]).await;
+    let server_addr = addr_of(&server);
+    tokio::spawn(crate::serve::run(server, vec![someone_else.id()], Offered {
+        tcp: vec![],
+        udp: vec![],
+    }));
+
+    let gave_up =
+        tokio::time::timeout(PATIENCE, crate::connect::run(stranger, server_addr, vec![], vec![]))
+            .await;
+    assert!(matches!(gave_up, Ok(Err(_))), "a refused connect must not retry: {gave_up:?}");
+}
+
 /// The other open door: an admitted peer naming a port the serving side never
 /// offered. Without this, `--tcp 22` grants every port on the loopback interface.
 #[tokio::test]

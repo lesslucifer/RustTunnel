@@ -5,13 +5,19 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
-use iroh::{EndpointAddr, endpoint::Connection};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use iroh::{
+    EndpointAddr,
+    endpoint::{Connection, ConnectionError},
+};
+use tokio::{
+    net::{TcpListener, TcpStream, UdpSocket},
+    task::AbortHandle,
+};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -23,6 +29,12 @@ use crate::{
 /// and is refused by the datagram cap rather than silently truncated here.
 const UDP_BUF: usize = 65_535;
 
+/// Retry delay after a lost or refused-to-open connection: doubles from a second
+/// to a half-minute ceiling. A peer that comes back in a minute is picked up
+/// within a minute; one that is gone all day costs two log lines an hour.
+const BACKOFF_START: Duration = Duration::from_secs(1);
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
 pub async fn run(
     ep: iroh::Endpoint,
     peer: EndpointAddr,
@@ -31,15 +43,16 @@ pub async fn run(
 ) -> Result<()> {
     println!("endpoint id {}", ep.id());
 
-    // Bound before dialing: a taken local port must fail the command, not leave a
-    // connected tunnel with nothing listening on it.
+    // Bound before dialing, and kept bound across reconnects: a taken local port
+    // must fail the command, and a client reaching 2222 during an outage should
+    // queue rather than find nothing listening.
     let mut tcp_listeners = Vec::new();
     for m in &tcp {
         let l = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, m.local))
             .await
             .with_context(|| format!("binding tcp 127.0.0.1:{}", m.local))?;
         info!(proto = "tcp", local = m.local, remote = m.remote, "listening");
-        tcp_listeners.push((l, *m));
+        tcp_listeners.push((Arc::new(l), *m));
     }
     let mut udp_sockets = Vec::new();
     for m in &udp {
@@ -50,40 +63,73 @@ pub async fn run(
         udp_sockets.push((Arc::new(s), *m));
     }
 
-    info!(id = %ep.id(), peer = %peer.id, "dialing");
-    // Dialing by id is mutually authenticated by construction: the QUIC handshake
-    // cannot complete against anything but the holder of that key.
-    let conn = ep.connect(peer.clone(), crate::ALPN).await.map_err(|e| anyhow!("connect: {e:#}"))?;
-    crate::report_path(&conn);
-
-    for (l, m) in tcp_listeners {
-        let conn = conn.clone();
-        tokio::spawn(accept_tcp(l, conn, m));
-    }
-    if !udp_sockets.is_empty() {
-        let sessions = Arc::new(Mutex::new(Sessions::default()));
-        for (s, m) in udp_sockets {
-            tokio::spawn(pump_udp_out(s, conn.clone(), m, sessions.clone()));
-        }
-        tokio::spawn(pump_udp_in(conn.clone(), sessions.clone()));
-        let reaper = sessions.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(crate::UDP_REAP_INTERVAL);
-            loop {
-                tick.tick().await;
-                reaper.lock().unwrap().reap();
+    let mut delay = BACKOFF_START;
+    loop {
+        info!(id = %ep.id(), peer = %peer.id, "dialing");
+        // Dialing by id is mutually authenticated by construction: the QUIC
+        // handshake cannot complete against anything but the holder of that key.
+        match ep.connect(peer.clone(), crate::ALPN).await {
+            Ok(conn) => {
+                delay = BACKOFF_START; // a link that formed once earns a fresh ladder
+                crate::report_path(&conn);
+                let tasks = spawn_forwarders(&conn, &tcp_listeners, &udp_sockets);
+                let reason = conn.closed().await;
+                tasks.iter().for_each(AbortHandle::abort);
+                // "Refused" and "gone" are different answers. The allowlist's close
+                // is a permanent no, and retrying it forever would be a busy loop
+                // against a decision that will not change.
+                if let ConnectionError::ApplicationClosed(c) = &reason {
+                    bail!("closed by peer: {} (code {})", c.reason.escape_ascii(), c.error_code);
+                }
+                warn!(peer = %peer.id, "connection lost: {reason}");
             }
-        });
+            Err(e) => warn!(peer = %peer.id, "dial failed: {}", anyhow!("{e:#}")),
+        }
+        info!(peer = %peer.id, retry_in = ?delay, "retrying");
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(BACKOFF_MAX);
     }
+}
 
-    let reason = conn.closed().await;
-    info!(peer = %peer.id, "closed: {reason}");
-    Ok(())
+/// Everything that carries bytes for one connection, so that losing the
+/// connection tears all of it down and the next one starts clean — in particular
+/// the UDP session table, whose ids the far side forgot when the link died.
+fn spawn_forwarders(
+    conn: &Connection,
+    tcp: &[(Arc<TcpListener>, PortMap)],
+    udp: &[(Arc<UdpSocket>, PortMap)],
+) -> Vec<AbortHandle> {
+    let mut tasks: Vec<AbortHandle> = tcp
+        .iter()
+        .map(|(l, m)| tokio::spawn(accept_tcp(l.clone(), conn.clone(), *m)).abort_handle())
+        .collect();
+    if !udp.is_empty() {
+        let sessions = Arc::new(Mutex::new(Sessions::default()));
+        for (s, m) in udp {
+            tasks.push(
+                tokio::spawn(pump_udp_out(s.clone(), conn.clone(), *m, sessions.clone()))
+                    .abort_handle(),
+            );
+        }
+        tasks.push(tokio::spawn(pump_udp_in(conn.clone(), sessions.clone())).abort_handle());
+        let reaper = sessions.clone();
+        tasks.push(
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(crate::UDP_REAP_INTERVAL);
+                loop {
+                    tick.tick().await;
+                    reaper.lock().unwrap().reap();
+                }
+            })
+            .abort_handle(),
+        );
+    }
+    tasks
 }
 
 // ---------------------------------------------------------------- TCP
 
-async fn accept_tcp(l: TcpListener, conn: Connection, m: PortMap) {
+async fn accept_tcp(l: Arc<TcpListener>, conn: Connection, m: PortMap) {
     loop {
         match l.accept().await {
             Ok((sock, from)) => {

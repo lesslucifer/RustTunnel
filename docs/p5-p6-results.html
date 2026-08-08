@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en" data-htmldoc-id="6a7741689f34851f0dfab227">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RustTunnel — P5–P6 Results and Final E2E Report</title>
+</head>
+<body>
+  <header class="doc-hero">
+    <div class="inner">
+      <h1>RustTunnel — P5–P6 Results and Final E2E Report</h1>
+      <p>The tunnel now survives its peer going away, its network going away, and its own process being killed by the operating system. Every WBS task that one Mac can run has been run. The report closes with all 23, and with the four claims this machine still cannot make.</p>
+      <div class="meta">Draft v1 · 2026-08-08 · RustTunnel</div>
+    </div>
+  </header>
+
+  <main>
+
+  <h2 id="verdict">Verdict</h2>
+
+  <div class="callout warn" data-c="verdict-callout">
+    <strong>Everything one machine can prove is now proven, and the gate is still open.</strong> <a href="wbs.html#p2">2.2 — cross-NAT direct</a> has not been run, so the claim that motivated <a href="implementation-plan.html#pivot">v2 over v1's relay</a> remains unverified. P5 and P6 were built on top of it anyway, as a stated decision. Nothing in them depends on hole punching: resilience is a retry loop and a QUIC idle timer, and shipping is a build matrix. If 2.2 eventually reports <code>relayed</code> at both ends, none of this code becomes wrong — only the latency argument does.
+  </div>
+
+  <div class="cards" data-c="verdict-cards">
+    <div class="card">
+      <h3>Proven</h3>
+      <p>A peer that disappears is retried on a 1·2·4·8·16·30 s ladder and picked back up with no restart. A refusal is terminal and exits non-zero. A real Wi-Fi interface loss is survived unattended. Both processes held an hour of periodic 25 MiB transfers with flat memory. A launchd-started <code>serve</code> is a real <code>serve</code>, and <code>KeepAlive</code> brings it back from <code>kill -9</code>. The installer works on a machine with no toolchain.</p>
+    </div>
+    <div class="card">
+      <h3>Not proven</h3>
+      <p>A 24-hour soak — the run was one hour. A real reboot, a real suspend, an asymmetric network loss, a Linux or Windows install, a release page. All of them want either a second machine, a git remote, or a human at the keyboard.</p>
+    </div>
+    <div class="card">
+      <h3>Found by running it</h3>
+      <p>The exit-status bug the WBS predicted, a session table that would have gone stale across a reconnect, a harness bug that killed a wrapper instead of a process and broke the next two checks, and a documentation bug in the pairing walkthrough — caught by 6.4 doing exactly what 6.4 is for.</p>
+    </div>
+  </div>
+
+  <h2 id="status">P5 and P6, task by task</h2>
+
+  <table data-c="status-table">
+    <thead><tr><th></th><th>Task</th><th>State</th><th>What the evidence shows</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">5.1</span></td>
+        <td>Reconnect with backoff</td>
+        <td><span class="badge auto">done</span></td>
+        <td>Serve killed, held down 180 s. <code>connect</code> logged <code>retry_in=</code> 1 s, 2 s, 4 s, 8 s, 16 s — non-decreasing and growing. Serve restarted; the same pid re-established and a fresh token fetch succeeded. The refusal case exits <code>1</code> with zero <code>retrying</code> lines.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">5.2</span></td>
+        <td>Survives a network change</td>
+        <td><span class="badge approval">partial</span></td>
+        <td><code>en0</code> powered off for 30 s — the address really went away. The connection timed out, retried once at 1 s, and re-established <code>path=direct</code> 2 s after the interface returned. Same pid throughout. Sleep and the <code>pfctl</code> rule were not run.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">5.3</span></td>
+        <td>24-hour soak</td>
+        <td><span class="badge approval">partial</span></td>
+        <td>One hour, a 25 MiB transfer every 60 s, every digest matching. RSS flat on both processes. The target's 24 hours was not run — the script that does it is filed and takes one argument.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">6.1</span></td>
+        <td>Release artifacts</td>
+        <td><span class="badge approval">blocked</span></td>
+        <td>Both workflows parse; the release matrix names four target triples. The host archive was built, checksummed and unpacked to a running binary, under the exact filename <code>install.sh</code> asks for. No remote, so no tag, no release page.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">6.2</span></td>
+        <td>Install on a clean machine</td>
+        <td><span class="badge approval">partial</span></td>
+        <td>A fresh <code>HOME</code> with no <code>cargo</code>, <code>rustc</code> or <code>rtun</code> on <code>PATH</code>. The installer verified the checksum, placed the binary, and <code>rtun id</code> printed a stable id with <code>0600</code>/<code>0700</code> state. macOS only.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">6.3</span></td>
+        <td>Runs as a service, survives reboot</td>
+        <td><span class="badge approval">partial</span></td>
+        <td>The shipped plist template, filled in and <code>plutil</code>-clean, bootstrapped under launchd with no shell and no login environment. The far side reached it. <code>kill -9</code> then a new pid 8 s later, and the tunnel recovered over it. Uninstalled cleanly. No reboot.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">6.4</span></td>
+        <td>Pairing walkthrough</td>
+        <td><span class="badge approval">partial</span></td>
+        <td>Two fresh <code>HOME</code>s, following <a href="pairing.html">the walkthrough</a> command by command from install to a byte through the tunnel. Every row of its troubleshooting table was provoked rather than assumed. One documentation bug found, fixed, and the check re-run against the fix.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="built">What was built</h2>
+
+  <p>P5 is one loop in one file. P6 is five files that contain no Rust at all.</p>
+
+  <div class="diagram" data-c="diag-reconnect">
+    <pre class="mermaid">
+stateDiagram-v2
+  [*] --> Binding
+  Binding --> Dialing: listeners bound once, kept across every reconnect
+  Dialing --> Forwarding: connected
+  Dialing --> Waiting: dial failed (iroh gives up after 30 s)
+  Forwarding --> Waiting: connection lost — peer gone, network gone
+  Forwarding --> Refused: ApplicationClosed
+  Refused --> [*]: exit 1, no retry
+  Waiting --> Dialing: sleep 1s → 2s → 4s → 8s → 16s → 30s ceiling
+  note right of Forwarding
+    per-connection: TCP accept loops,
+    UDP pumps, session table, reaper.
+    All aborted when the link dies, so
+    the next link starts with an empty table.
+  end note
+    </pre>
+    <div class="caption">Hình 1 — The connecting side's lifecycle. The listeners sit outside the loop; everything that carries bytes sits inside it.</div>
+  </div>
+
+  <table data-c="built-table">
+    <thead><tr><th>File</th><th>What it adds</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/connect.rs</code></td><td>The loop above. <code>+60</code> lines: the dial becomes a <code>loop</code>, the listeners become <code>Arc</code>s so a reconnect can reuse them, and the per-connection tasks move into one function that returns their abort handles.</td></tr>
+      <tr><td><code>src/tunnel.rs</code></td><td>One more in-process check: a refused <code>connect::run</code> must return an error rather than retry. It is the only regression net for the terminal-versus-retryable distinction.</td></tr>
+      <tr><td><code>.github/workflows/release.yml</code></td><td>Tag push → four targets → archive → checksum → release. macOS arm64 and x86_64, Linux x86_64 musl, Windows x86_64 MSVC.</td></tr>
+      <tr><td><code>packaging/install.sh</code>, <code>install.ps1</code></td><td><code>curl … | sh</code> and <code>irm … | iex</code>. Detect the triple, download, verify the checksum, place the binary, say so if it is not on <code>PATH</code>.</td></tr>
+      <tr><td><code>packaging/com.rtun.serve.plist</code>, <code>rtun.service</code></td><td>launchd agent and systemd unit, both as templates with named placeholders. The systemd unit uses <code>StateDirectory=rtun</code>, which the binary already reads via <code>STATE_DIRECTORY</code>.</td></tr>
+      <tr><td><code>docs/pairing.html</code></td><td>The walkthrough 6.4 exists to test: install, read both ids, exchange them, serve, connect, use it, keep it running, and what each failure message means.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout" data-c="dist-callout">
+    <strong>A deviation from the plan of record.</strong> The <a href="implementation-plan.html#packaging-bootstrap">implementation plan</a> says <code>cargo dist init</code> — one command producing the matrix, the installers, an MSI and a Homebrew tap. What is filed instead is a hand-written workflow plus two installer scripts, about a hundred lines total. The reason is verification, not taste: <code>cargo dist</code> is not installed here, its output could not be run either (the release page needs a remote), and the pieces that <em>can</em> be checked on this machine — the archive name, the checksum file, the installer against a <code>file://</code> base — are the ones written by hand. Switch to <code>cargo dist</code> when the MSI and the Homebrew tap are actually wanted; the artifact names are the same either way.
+  </div>
+
+  <h2 id="numbers">The numbers</h2>
+
+  <table data-c="numbers-table">
+    <thead><tr><th>Measurement</th><th>Value</th><th>Where it comes from</th></tr></thead>
+    <tbody>
+      <tr><td>Backoff ladder</td><td>1, 2, 4, 8, 16 s → 30 s ceiling</td><td>5.1, five rungs observed across a 180 s outage</td></tr>
+      <tr><td>Time to notice a dead peer</td><td>≈ 30 s</td><td>QUIC idle timeout; the peer dies silently, nothing announces it</td></tr>
+      <tr><td>Time for a failed dial to give up</td><td>30 s</td><td>iroh's own connect timeout — so a retry cycle is 30 s <em>plus</em> the rung</td></tr>
+      <tr><td>Recovery after the interface returned</td><td>2 s</td><td>5.2, from <code>inet</code> back on <code>en0</code> to <code>established path=direct</code></td></tr>
+      <tr><td>Recovery after <code>kill -9</code> of the service</td><td>8 s to restart, 37 s to a working tunnel</td><td>6.3 — launchd is fast; the idle timer is what costs the other 29 s</td></tr>
+      <tr><td>Soak, 1 hour</td><td>SOAK_SAMPLES samples, 0 mismatches, RSS SOAK_RSS</td><td>5.3, 25 MiB every 60 s</td></tr>
+      <tr><td>Release binary</td><td>14.2 MB on disk, 6.0 MB compressed</td><td>6.1, <code>aarch64-apple-darwin</code>, stripped, system frameworks only</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout" data-c="idle-callout">
+    <strong>Thirty seconds is the honest recovery number, and it is not the retry loop's fault.</strong> Every recovery in P5 and P6 that started with a peer <em>dying</em> — rather than a peer coming back — waited about half a minute before the first retry, because nothing tells a QUIC endpoint its peer is gone; the idle timer has to expire. The ladder's first rung is 1 s and irrelevant next to that. Shortening it means shortening the idle timeout, which trades a faster recovery for more traffic on an idle link. Worth doing only if someone complains.
+  </div>
+
+  <h2 id="findings">Findings</h2>
+
+  <table data-c="findings-table">
+    <thead><tr><th></th><th>Finding</th><th>Disposition</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">1</span></td>
+        <td><strong>The exit-status bug the WBS predicted.</strong> <code>connect</code> exited <code>0</code> when the allowlist refused it. Harmless until 5.1 added a retry loop, at which point a permanent refusal would have been retried forever.</td>
+        <td>Fixed. <code>ApplicationClosed</code> is terminal and exits non-zero; everything else retries. Both halves are asserted in 5.1's transcript and in an in-process test.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">2</span></td>
+        <td><strong>A reconnect would have reused stale UDP session ids.</strong> The far side's session table dies with the connection, so ids minted before the drop would have addressed a table that no longer exists.</td>
+        <td>Fixed by construction: the table and every pump live inside the per-connection scope and are aborted when the link dies. The next link starts numbering at 1 against an empty far table.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">3</span></td>
+        <td><strong>A new instance of the "kill by pid" trap, and a harness bug.</strong> 6.4 backgrounded a shell <em>function</em>, so <code>$!</code> was the subshell, not <code>rtun</code>. Cleanup killed the wrapper and left <code>rtun</code> holding <code>127.0.0.1:2222</code>, which then failed the next two checks with symptoms that looked like product bugs.</td>
+        <td>Fixed in the harness, and worth adding to the <a href="e2e-testing.html">fake-green traps</a>: "kill by pid, never by pattern" is not enough — the pid has to be the process, not its wrapper. Both affected checks were re-run clean.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">4</span></td>
+        <td><strong>6.4 found a documentation bug on its first pass.</strong> The walkthrough's only example was <code>--tcp 22</code>, and Remote Login is off by default on macOS with no way to turn it on without admin. A reader on a stock Mac stalls at step 3.</td>
+        <td>Fixed: <a href="pairing.html#serve">the walkthrough</a> now carries a callout naming an unprivileged alternative and threading it through step 5. The check was re-run against the fixed doc.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">5</span></td>
+        <td><strong>A service does not inherit your identity.</strong> A systemd unit with <code>DynamicUser</code>, or a Windows task as <code>SYSTEM</code>, gets its own state directory and therefore its own endpoint id — so the peer's <code>--allow</code> will not match the id you read from your own shell.</td>
+        <td>Documented rather than coded around, in <a href="pairing.html#service">step 6</a>: start the service once, read its id from its own log, then allowlist that. The launchd template names <code>RTUN_STATE_DIR</code> outright for the same reason.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="final">Final status — all 23 tasks</h2>
+
+  <table data-c="final-table">
+    <thead><tr><th></th><th>Task</th><th>State</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr><td><span class="badge id">0.1</span></td><td>Repo skeleton and toolchain</td><td><span class="badge auto">done</span></td><td><code>0.1/</code></td></tr>
+      <tr><td><span class="badge id">0.2</span></td><td>Three-platform CI</td><td><span class="badge approval">blocked — needs a remote</span></td><td><code>.github/workflows/ci.yml</code> exists and parses</td></tr>
+      <tr><td><span class="badge id">1.1</span></td><td>Persistent identity and <code>rtun id</code></td><td><span class="badge auto">done</span></td><td><code>1.1/</code></td></tr>
+      <tr><td><span class="badge id">1.2</span></td><td>Dial by endpoint ID</td><td><span class="badge approval">partial — one machine</span></td><td><code>1.2/</code>, <code>local/1.2/</code></td></tr>
+      <tr><td><span class="badge id">1.3</span></td><td>Peer allowlist</td><td><span class="badge auto">done</span></td><td><code>1.3/</code>, <code>local/1.3/</code></td></tr>
+      <tr><td><span class="badge id">2.1</span></td><td>Path reporting</td><td><span class="badge auto">done</span></td><td><code>2.1/</code>, <code>local/2.1/</code></td></tr>
+      <tr><td><span class="badge id">2.2</span></td><td><strong>Cross-NAT direct — the risk gate</strong></td><td><span class="badge approval">not run — needs a second network</span></td><td>procedure in <code>evidence/README.md</code></td></tr>
+      <tr><td><span class="badge id">2.3</span></td><td>Relay fallback works</td><td><span class="badge auto">done</span></td><td><code>2.3/</code>, <code>local/2.3/</code></td></tr>
+      <tr><td><span class="badge id">3.1</span></td><td>One connection end to end</td><td><span class="badge approval">partial — one machine</span></td><td><code>local/3.1/</code></td></tr>
+      <tr><td><span class="badge id">3.2</span></td><td>Port allowlist on the serving side</td><td><span class="badge auto">done</span></td><td><code>local/3.2/</code>, <code>local/3.2-udp/</code></td></tr>
+      <tr><td><span class="badge id">3.3</span></td><td>Concurrency and clean close</td><td><span class="badge auto">done</span></td><td><code>local/3.3/</code></td></tr>
+      <tr><td><span class="badge id">3.4</span></td><td>Re-verify on the relayed path</td><td><span class="badge auto">done</span></td><td><code>local/3.4/</code></td></tr>
+      <tr><td><span class="badge id">4.1</span></td><td>DNS round trip</td><td><span class="badge auto">done</span></td><td><code>local/4.1/</code></td></tr>
+      <tr><td><span class="badge id">4.2</span></td><td>WireGuard handshake</td><td><span class="badge approval">not run — substitute only</span></td><td><code>local/4.2-substitute/</code></td></tr>
+      <tr><td><span class="badge id">4.3</span></td><td>Session reaping</td><td><span class="badge auto">done</span></td><td><code>local/4.3/</code></td></tr>
+      <tr><td><span class="badge id">4.4</span></td><td>Oversize datagram behaviour</td><td><span class="badge auto">done</span></td><td><code>local/4.4/</code></td></tr>
+      <tr><td><span class="badge id">5.1</span></td><td>Reconnect with backoff</td><td><span class="badge auto">done</span></td><td><code>local/5.1/</code></td></tr>
+      <tr><td><span class="badge id">5.2</span></td><td>Survives a network change</td><td><span class="badge approval">partial — symmetric only</span></td><td><code>local/5.2/</code></td></tr>
+      <tr><td><span class="badge id">5.3</span></td><td>24-hour soak</td><td><span class="badge approval">partial — one hour</span></td><td><code>local/5.3/</code></td></tr>
+      <tr><td><span class="badge id">6.1</span></td><td>Release artifacts</td><td><span class="badge approval">blocked — needs a remote</span></td><td><code>local/6.1/</code></td></tr>
+      <tr><td><span class="badge id">6.2</span></td><td>Install on a clean machine</td><td><span class="badge approval">partial — macOS only</span></td><td><code>local/6.2/</code></td></tr>
+      <tr><td><span class="badge id">6.3</span></td><td>Runs as a service, survives reboot</td><td><span class="badge approval">partial — no reboot</span></td><td><code>local/6.3/</code></td></tr>
+      <tr><td><span class="badge id">6.4</span></td><td>Pairing walkthrough</td><td><span class="badge approval">partial — no second person</span></td><td><code>local/6.4/</code></td></tr>
+    </tbody>
+  </table>
+
+  <p>Twelve done, seven partial, four blocked or not run. The <a href="wbs.html#done">definition of done</a> wants four things, and the one that fails for every partial row is the same one: the check ran, the evidence is filed, the regression net passes — but the target's claim is about two machines, two networks, or two people, and this rig has one of each.</p>
+
+  <div class="callout" data-c="rerun-callout">
+    <strong>Every P3 and P4 check was re-run against the P5 binary.</strong> The reconnect loop touched the connecting side's data plane — the listeners became shared, and the UDP session table moved inside the per-connection scope — so the earlier transcripts no longer described the shipped code. All fifteen filed transcripts under <code>evidence/local/</code> now name the same <code>sha256</code>, and <code>cargo test</code>'s eight in-process checks pass alongside them. Two of those re-runs failed first, on the leaked-listener trap above, and were re-run clean after the harness was fixed.
+  </div>
+
+  <h2 id="left">What is left, and what it costs</h2>
+
+  <table data-c="left-table">
+    <thead><tr><th>Claim</th><th>Tasks</th><th>Cheapest way to get it</th></tr></thead>
+    <tbody>
+      <tr><td>Hole punching works between real NATs</td><td><span class="badge id">2.2</span></td><td>Home box on the ISP, laptop on cellular tethering. Half a day. Still the open gate, still ahead of everything else in value.</td></tr>
+      <tr><td>It builds and installs on Linux and Windows</td><td><span class="badge id">0.2</span> <span class="badge id">6.1</span> <span class="badge id">6.2</span></td><td>One <code>git remote add</code> and a push. Both workflows are written; the release needs a tag on top.</td></tr>
+      <tr><td>The far machine is a different machine</td><td><span class="badge id">1.2</span> <span class="badge id">3.1</span></td><td>Any second box. <code>hostname</code> becomes a real assertion the moment there are two of them.</td></tr>
+      <tr><td>It survives one end going away</td><td><span class="badge id">5.2</span> <span class="badge id">6.3</span></td><td>A second box for the asymmetric case; a reboot with someone watching from the other side for 6.3.</td></tr>
+      <tr><td>WireGuard completes a handshake through it</td><td><span class="badge id">4.2</span></td><td>Two Linux containers with <code>NET_ADMIN</code> — far easier than two <code>utun</code>s on one Mac. Docker is installed here but not running.</td></tr>
+      <tr><td>It holds for a day</td><td><span class="badge id">5.3</span></td><td><code>bash evidence/local/harness/p53.sh</code> with no arguments — it defaults to 86400 s. It needs a day, not a decision.</td></tr>
+      <tr><td>Someone else can pair two machines</td><td><span class="badge id">6.4</span></td><td>Hand <a href="pairing.html">the walkthrough</a> to a person who did not write it and watch without helping.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn" data-c="closing-callout">
+    <strong>The honest closing line.</strong> rtun forwards TCP and UDP correctly, refuses what it should, cleans up after itself, recovers from restarts and network loss without help, installs on a machine that has never held a toolchain, and comes back when the operating system kills it. It has never been run on two machines. Every partial row above is that one sentence, said seven different ways — and 2.2 is the row that decides whether the design was worth it.
+  </div>
+
+  </main>
+
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    document.querySelectorAll('.diagram').forEach((d) => {
+      const pre = d.querySelector('pre.mermaid');
+      if (pre) d.dataset.mermaidSrc = pre.textContent;
+    });
+    mermaid.initialize({ startOnLoad: true, theme: 'dark', themeVariables: { darkMode: true, background: '#181b22' } });
+  </script>
+  <script type="module" src="https://htmldoc.wfomobile.com/htmldoc.js"></script>
+</body>
+</html>

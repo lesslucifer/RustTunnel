@@ -185,6 +185,12 @@ connect.log
     than it looks once <span class="badge id">5.1</span> lands reconnect: a refused peer must not be
     retried forever, an absent peer must be. Distinguish <code>ApplicationClosed</code> from the other
     close reasons and exit non-zero on it.
+    <br><br>
+    <strong>Fixed when 5.1 landed.</strong> <code>ApplicationClosed</code> is terminal and exits
+    <code>1</code>; every other close reason feeds the retry ladder. Asserted twice — in
+    <a href="p5-p6-results.html#status">5.1's transcript</a>, which requires zero <code>retrying</code>
+    lines on the refused run, and in an in-process test that fails if a refused
+    <code>connect::run</code> ever returns to the loop.
   </div>
 
   <h2 id="coverage">Coverage matrix</h2>
@@ -576,7 +582,9 @@ done | tee evidence/local/5.3/soak.txt</code></pre>
 
   <h2 id="traps">Fake-green traps</h2>
 
-  <p>Five ways a local run passes while the tunnel is broken. Each is cheap to defend against.</p>
+  <p>Seven ways a local run passes while the tunnel is broken. Each is cheap to defend against. The
+  last two were found by <a href="p5-p6-results.html#findings">running P5 and P6</a> — one run leaked
+  a listener, and the next run passed against it.</p>
 
   <div class="cards">
     <div class="card">
@@ -609,6 +617,22 @@ done | tee evidence/local/5.3/soak.txt</code></pre>
       <code>serve</code> by pattern killed a long-running relay hold in another shell, which then
       logged <code>closed: timed out</code> and looked exactly like a product failure. On a one-Mac
       rig, kill by PID. Never by pattern.</p>
+    </div>
+    <div class="card">
+      <h3>A pid that is not the process</h3>
+      <p>"Kill by PID, never by pattern" is not enough. Backgrounding a shell <em>function</em> —
+      <code>homebox rtun serve … &amp;</code> — makes <code>$!</code> the subshell, so the cleanup kills
+      the wrapper and leaves <code>rtun</code> holding <code>2222</code>. It broke 6.4's own cleanup and
+      then two later checks. Background <code>env</code> or the binary directly, which <code>exec</code>
+      and keep their pid.</p>
+    </div>
+    <div class="card">
+      <h3>An early <code>exit 1</code> that leaks a listener</h3>
+      <p>A check that fails halfway and exits without an <code>EXIT</code> trap leaves its
+      <code>http.server</code> bound. The next run's own listener silently fails to bind, the stale one
+      answers every request, and the check passes carrying nothing. Every script gets
+      <code>trap … EXIT</code> <em>and</em> <code>require_free</code> — the trap stops it happening, the
+      guard stops it being believed.</p>
     </div>
     <div class="card">
       <h3>The service answering directly</h3>

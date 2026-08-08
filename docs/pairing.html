@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en" data-htmldoc-id="6a7741689f34851f0dfab225">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RustTunnel — Pairing Two Machines</title>
+</head>
+<body>
+  <header class="doc-hero">
+    <div class="inner">
+      <h1>RustTunnel — Pairing Two Machines</h1>
+      <p>Install rtun on both machines, let them learn each other's public key, and reach one machine's ports from the other. Fifteen minutes, no account, no server.</p>
+      <div class="meta">Draft v1 · 2026-08-08 · RustTunnel</div>
+    </div>
+  </header>
+
+  <main>
+
+  <h2 id="before">Before you start</h2>
+
+  <p>You need two machines you own and a shell on each. Nothing else — there is no signup, no config file and no central server to point at. The two machines find each other by public key through a public discovery service, and talk directly once they have.</p>
+
+  <div class="cards" data-c="roles-cards">
+    <div class="card">
+      <h3>The serving machine</h3>
+      <p>The one with something on it you want to reach — a home box with SSH, a NAS, a database. It runs <code>rtun serve</code> and names which of its local ports may be reached.</p>
+    </div>
+    <div class="card">
+      <h3>The connecting machine</h3>
+      <p>The laptop you are sitting at. It runs <code>rtun connect</code> and turns the far machine's ports into ports on its own <code>127.0.0.1</code>.</p>
+    </div>
+    <div class="card">
+      <h3>Both directions</h3>
+      <p>Each side must know the other's ID: the serving side to allow it in, the connecting side to dial it. That two-way exchange is the whole of pairing.</p>
+    </div>
+  </div>
+
+  <div class="diagram" data-c="diag-pairing">
+    <pre class="mermaid">
+sequenceDiagram
+  participant H as home box
+  participant L as laptop
+  Note over H,L: step 1 — install on both
+  H->>H: rtun id  →  ID_HOME
+  L->>L: rtun id  →  ID_LAPTOP
+  Note over H,L: step 2 — read each ID out and carry it to the other machine
+  L-->>H: ID_LAPTOP
+  H-->>L: ID_HOME
+  Note over H: step 3 — rtun serve --tcp 22 --allow ID_LAPTOP
+  Note over L: step 4 — rtun connect ID_HOME --tcp 2222:22
+  L->>H: ssh -p 2222 127.0.0.1
+    </pre>
+    <div class="caption">Hình 1 — Both IDs cross, in opposite directions. Missing either one is the single most common pairing failure.</div>
+  </div>
+
+  <h2 id="install">Step 1 — Install on both machines</h2>
+
+  <table data-c="install-table">
+    <thead><tr><th>Platform</th><th>Command</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>macOS, Linux</td>
+        <td><code>curl -fsSL https://raw.githubusercontent.com/lesslucifer/RustTunnel/main/packaging/install.sh | sh</code></td>
+      </tr>
+      <tr>
+        <td>Windows (PowerShell)</td>
+        <td><code>irm https://raw.githubusercontent.com/lesslucifer/RustTunnel/main/packaging/install.ps1 | iex</code></td>
+      </tr>
+      <tr>
+        <td>From source</td>
+        <td><code>cargo build --release</code>, then copy <code>target/release/rtun</code> anywhere on your <code>PATH</code>.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>The installer puts <code>rtun</code> in <code>~/.local/bin</code> (<code>%LOCALAPPDATA%\rtun\bin</code> on Windows) and tells you if that directory is not on your <code>PATH</code>. If it says so, either add it to your shell profile or type the full path everywhere below — the walkthrough works the same either way.</p>
+
+  <p>Check it landed:</p>
+
+  <pre><code>rtun --version
+rtun --help</code></pre>
+
+  <h2 id="ids">Step 2 — Read both IDs, and carry each to the other machine</h2>
+
+  <p>On <strong>each</strong> machine:</p>
+
+  <pre><code>rtun id
+# 3ef09bf26bfd29946ee8e3da2d18d56bbd5cb8a40a817084b9343950b6bed842</code></pre>
+
+  <p>That 64-character string is the machine's public key and its permanent address. It is generated the first time you run any <code>rtun</code> command, kept in <code>~/.local/state/rtun/secret.key</code>, and stays the same across restarts and reboots. It is not a secret — it is safe to paste into chat, mail it to yourself, or read it aloud over the phone.</p>
+
+  <p>Write both down somewhere you can see them at once. The rest of this document calls them <code>ID_HOME</code> and <code>ID_LAPTOP</code>.</p>
+
+  <div class="callout" data-c="id-callout">
+    <strong>Only the key file is secret.</strong> <code>secret.key</code> is created owner-readable (<code>0600</code>) in an owner-only directory. Anyone who copies that file becomes that machine as far as the other side is concerned. Deleting it makes a new identity, which means re-pairing — the other side's <code>--allow</code> will no longer match.
+  </div>
+
+  <h2 id="serve">Step 3 — On the serving machine, offer ports to that one peer</h2>
+
+  <pre><code>rtun serve --tcp 22 --allow ID_LAPTOP</code></pre>
+
+  <p>Two allowlists are at work, and both matter:</p>
+
+  <table data-c="serve-flags">
+    <thead><tr><th>Flag</th><th>Means</th></tr></thead>
+    <tbody>
+      <tr><td><code>--allow ID</code></td><td>Only this peer may connect at all. Repeat it for more peers. It is required — there is no "allow anyone" mode.</td></tr>
+      <tr><td><code>--tcp PORT</code></td><td>This local TCP port may be reached through the tunnel. Repeat for more ports. A port you do not list is refused even to an allowed peer.</td></tr>
+      <tr><td><code>--udp PORT</code></td><td>The same, for UDP — a DNS resolver on <code>5353</code>, a WireGuard endpoint on <code>51820</code>.</td></tr>
+      <tr><td><code>--relay-only</code></td><td>Skip direct paths entirely. Slower; useful for testing and for networks where hole punching does not work.</td></tr>
+    </tbody>
+  </table>
+
+  <p>Leave it running. It prints its own ID on the first line, then a line per event.</p>
+
+  <div class="callout" data-c="port22-callout">
+    <strong>Nothing listening on 22 yet?</strong> <code>--tcp 22</code> only means "port 22 may be reached" — it does not start SSH. On macOS, Remote Login is off by default and turning it on needs an administrator (System Settings → General → Sharing). To try the tunnel first without admin rights, offer a port you can serve yourself: run <code>python3 -m http.server 8022 --bind 127.0.0.1</code> on the serving machine, use <code>--tcp 8022</code> here and <code>--tcp 2222:8022</code> in step 4, and fetch <code>http://127.0.0.1:2222/</code> in step 5.
+  </div>
+
+  <h2 id="connect">Step 4 — On the laptop, map the far port onto a local one</h2>
+
+  <pre><code>rtun connect ID_HOME --tcp 2222:22</code></pre>
+
+  <p><code>2222:22</code> reads local-first: <em>this machine's</em> port 2222 becomes <em>the far machine's</em> port 22. Pick any free local port; it does not have to differ from the remote one, and on macOS anything below 1024 needs admin, so 2222 is the easy choice.</p>
+
+  <p>Within a few seconds both sides log the same connection from their own end:</p>
+
+  <pre><code>INFO rtun::serve: admitted peer=51d710cbd4…
+INFO rtun: established peer=51d710cbd4 path=relayed addr=relay:… rtt=104ms
+INFO rtun: path selected peer=51d710cbd4 path=direct addr=ip:192.168.1.8:61393</code></pre>
+
+  <p><code>path=relayed</code> first and <code>path=direct</code> a moment later is the normal, healthy sequence — the two machines have to talk through the relay before they can talk directly. See <a href="implementation-plan.html">the plan</a> for why.</p>
+
+  <h2 id="use">Step 5 — Use it</h2>
+
+  <pre><code>ssh -p 2222 127.0.0.1        # you are on the far machine
+hostname                     # …and it says so</code></pre>
+
+  <p>Any TCP client works the same way: point it at <code>127.0.0.1:2222</code> and it reaches port 22 on the other machine. For UDP, add <code>--udp 5354:5353</code> on the connecting side and <code>--udp 5353</code> on the serving side, then <code>dig -p 5354 @127.0.0.1 example.com</code>.</p>
+
+  <div class="callout" data-c="alive-callout">
+    <strong>Leave both running.</strong> The connecting side reconnects on its own if the link drops — it retries with a growing delay and picks the peer back up when it returns, with no restart. The one thing it does <em>not</em> retry is a refusal: if the serving side's <code>--allow</code> does not list you, <code>rtun connect</code> says so and exits non-zero rather than hammering a permanent no.
+  </div>
+
+  <h2 id="service">Step 6 — Keep the serving machine serving, across reboots</h2>
+
+  <table data-c="service-table">
+    <thead><tr><th>Platform</th><th>Steps</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>macOS</td>
+        <td>
+<pre><code>sed -e "s|__RTUN__|$HOME/.local/bin/rtun|" -e "s|__PEER__|ID_LAPTOP|" \
+    -e "s|__PORT__|22|" -e "s|__STATE__|$HOME/.local/state/rtun|" \
+    -e "s|__HOME__|$HOME|" packaging/com.rtun.serve.plist \
+    &gt; ~/Library/LaunchAgents/com.rtun.serve.plist
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.rtun.serve.plist
+launchctl list com.rtun.serve      # a PID means it is up</code></pre>
+          Logs land in <code>~/Library/Logs/rtun-serve.log</code>. To remove it: <code>launchctl bootout gui/$UID/com.rtun.serve</code> and delete the plist.
+        </td>
+      </tr>
+      <tr>
+        <td>Linux</td>
+        <td>
+<pre><code>sudo cp packaging/rtun.service /etc/systemd/system/
+sudoedit /etc/systemd/system/rtun.service   # set --allow and the ports
+sudo systemctl enable --now rtun
+systemctl status rtun</code></pre>
+          The unit uses <code>StateDirectory=rtun</code>, so the identity lives in <code>/var/lib/rtun</code> and survives restarts. Note that this is a <em>different</em> identity from the one your user account got — run <code>sudo systemctl start rtun</code> once and read the ID out of <code>journalctl -u rtun</code> before allowlisting it.
+        </td>
+      </tr>
+      <tr>
+        <td>Windows</td>
+        <td>
+<pre><code>schtasks /create /tn rtun /sc onstart /ru SYSTEM ^
+  /tr "%LOCALAPPDATA%\rtun\bin\rtun.exe serve --tcp 22 --allow ID_LAPTOP"</code></pre>
+          Same caveat as systemd: running as <code>SYSTEM</code> gives it a different state directory, so read its ID from its own first run.
+        </td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="troubleshooting">When it does not work</h2>
+
+  <table data-c="trouble-table">
+    <thead><tr><th>What you see</th><th>What it means</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>Error: closed by peer: not in --allow (code 1)</code>, exit 1</td>
+        <td>The serving side does not list this machine's ID. Re-read <code>rtun id</code> on the connecting machine and check it against the <code>--allow</code> on the serving one — a truncated paste is the usual cause.</td>
+      </tr>
+      <tr>
+        <td>Serving side logs <code>refused: port not in --tcp</code></td>
+        <td>The mapping names a remote port the serving side never offered. Add <code>--tcp &lt;that port&gt;</code> there and restart it.</td>
+      </tr>
+      <tr>
+        <td>Client hangs, connecting side logs <code>retrying … retry_in=</code></td>
+        <td>The far machine is not reachable — not running, asleep, or offline. This is the retry loop doing its job; it recovers by itself when the peer returns.</td>
+      </tr>
+      <tr>
+        <td><code>binding tcp 127.0.0.1:2222: Address already in use</code></td>
+        <td>Something else holds that local port, often an <code>rtun connect</code> you started earlier. Pick another local port or stop the old one.</td>
+      </tr>
+      <tr>
+        <td>Stays <code>path=relayed</code></td>
+        <td>Working, but going the long way round. Both networks are behind NATs that could not be punched through. Everything still functions, with more latency and less bandwidth.</td>
+      </tr>
+      <tr>
+        <td>Both machines print the same ID</td>
+        <td>They are sharing a state directory — you are running both roles on one machine. Give one of them its own: <code>RTUN_STATE_DIR=/tmp/rtun-b rtun connect …</code>.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  </main>
+
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    document.querySelectorAll('.diagram').forEach((d) => {
+      const pre = d.querySelector('pre.mermaid');
+      if (pre) d.dataset.mermaidSrc = pre.textContent;
+    });
+    mermaid.initialize({ startOnLoad: true, theme: 'dark', themeVariables: { darkMode: true, background: '#181b22' } });
+  </script>
+  <script type="module" src="https://htmldoc.wfomobile.com/htmldoc.js"></script>
+</body>
+</html>
