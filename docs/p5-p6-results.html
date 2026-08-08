@@ -25,7 +25,7 @@
   <div class="cards" data-c="verdict-cards">
     <div class="card">
       <h3>Proven</h3>
-      <p>A peer that disappears is retried on a 1·2·4·8·16·30 s ladder and picked back up with no restart. A refusal is terminal and exits non-zero. A real Wi-Fi interface loss is survived unattended. Both processes held an hour of periodic 25 MiB transfers with flat memory. A launchd-started <code>serve</code> is a real <code>serve</code>, and <code>KeepAlive</code> brings it back from <code>kill -9</code>. The installer works on a machine with no toolchain.</p>
+      <p>A peer that disappears is retried on a 1·2·4·8·16·30 s ladder and picked back up with no restart. A refusal is terminal and exits non-zero. A real Wi-Fi interface loss is survived unattended. Both processes held an hour of periodic 25 MiB transfers, 60 for 60 on digests, with memory that peaked mid-window rather than climbing. A launchd-started <code>serve</code> is a real <code>serve</code>, and <code>KeepAlive</code> brings it back from <code>kill -9</code>. The installer works on a machine with no toolchain.</p>
     </div>
     <div class="card">
       <h3>Not proven</h3>
@@ -58,7 +58,7 @@
         <td><span class="badge id">5.3</span></td>
         <td>24-hour soak</td>
         <td><span class="badge approval">partial</span></td>
-        <td>One hour, a 25 MiB transfer every 60 s, every digest matching. RSS flat on both processes. The target's 24 hours was not run — the script that does it is filed and takes one argument.</td>
+        <td>One hour, a 25 MiB transfer every 60 s, 60 matching digests, both processes alive at the end. Memory rose about 4 MB over the first 25 minutes, plateaued, then fell — the peak is in the middle of the window, not at the end. One unplanned reconnect at minute 1, recovered unattended in 7 s. The target's 24 hours was not run.</td>
       </tr>
       <tr>
         <td><span class="badge id">6.1</span></td>
@@ -138,13 +138,20 @@ stateDiagram-v2
       <tr><td>Time for a failed dial to give up</td><td>30 s</td><td>iroh's own connect timeout — so a retry cycle is 30 s <em>plus</em> the rung</td></tr>
       <tr><td>Recovery after the interface returned</td><td>2 s</td><td>5.2, from <code>inet</code> back on <code>en0</code> to <code>established path=direct</code></td></tr>
       <tr><td>Recovery after <code>kill -9</code> of the service</td><td>8 s to restart, 37 s to a working tunnel</td><td>6.3 — launchd is fast; the idle timer is what costs the other 29 s</td></tr>
-      <tr><td>Soak, 1 hour</td><td>SOAK_SAMPLES samples, 0 mismatches, RSS SOAK_RSS</td><td>5.3, 25 MiB every 60 s</td></tr>
+      <tr><td>Soak, 1 hour</td><td>60 transfers, 60 matching digests, 0 failures</td><td>5.3, 25 MiB every 60 s</td></tr>
+      <tr><td>Soak RSS, <code>serve</code></td><td>26.2 MB → peak 30.2 → 28.0 at the end</td><td>5.3, sampled with every transfer</td></tr>
+      <tr><td>Soak RSS, <code>connect</code></td><td>20.1 MB → peak 23.6 → 21.2 at the end</td><td>5.3, same samples</td></tr>
+      <tr><td>Transfer time, 25 MiB direct</td><td>0.207–0.377 s across the hour</td><td>5.3, no drift</td></tr>
       <tr><td>Release binary</td><td>14.2 MB on disk, 6.0 MB compressed</td><td>6.1, <code>aarch64-apple-darwin</code>, stripped, system frameworks only</td></tr>
     </tbody>
   </table>
 
   <div class="callout" data-c="idle-callout">
     <strong>Thirty seconds is the honest recovery number, and it is not the retry loop's fault.</strong> Every recovery in P5 and P6 that started with a peer <em>dying</em> — rather than a peer coming back — waited about half a minute before the first retry, because nothing tells a QUIC endpoint its peer is gone; the idle timer has to expire. The ladder's first rung is 1 s and irrelevant next to that. Shortening it means shortening the idle timeout, which trades a faster recovery for more traffic on an idle link. Worth doing only if someone complains.
+  </div>
+
+  <div class="callout" data-c="soak-callout">
+    <strong>What an hour of soak does and does not say.</strong> Both processes rose about 4 MB over the first twenty-five minutes, sat there, and then dropped back — together, in the same sample, which is the operating system reclaiming rather than either process freeing. The useful part is the shape: the peak is in the middle of the window, so nothing is climbing monotonically, and a session-table or socket leak under this workload would climb. What an hour cannot do is separate a plateau from a leak slow enough to matter over a day, which is exactly why the task asks for twenty-four. The run also carried an unplanned reconnect a minute in — the relay path timed out before the direct one was selected, the ladder retried once at 1 s, and it came back <code>path=direct</code> and stayed there for the remaining fifty-nine minutes. That is 5.1 working with nobody watching, which is the only way it ever really gets tested.
   </div>
 
   <h2 id="findings">Findings</h2>
