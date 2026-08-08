@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RustTunnel — P3–P4 Result Report</title>
+</head>
+<body>
+  <header class="doc-hero">
+    <div class="inner">
+      <h1>RustTunnel — P3–P4 Result Report</h1>
+      <p>The data plane exists and carries real TCP and real UDP. Seven of eight tasks close on the evidence filed; two remain open for want of a second machine — and the risk gate above them is still open too.</p>
+      <div class="meta">Draft v1 · 2026-08-08 · RustTunnel</div>
+    </div>
+  </header>
+
+  <main>
+
+  <h2 id="verdict">Verdict</h2>
+
+  <div class="callout warn" data-c="verdict-callout">
+    <strong>P3 and P4 were built and run on top of an unproven gate.</strong> The <a href="wbs.html#p2">WBS</a> puts 2.2 — cross-NAT direct — before any forwarding code, and 2.2 is still <a href="p0-p2-results.html#gate">not run</a>. This work was done anyway because it was asked for; that is a stated decision, not an oversight. Nothing below depends on hole punching: the data plane is written against an ordinary QUIC connection and is verified over both the direct and the relayed path. If 2.2 eventually reports <code>relayed</code> on both sides, none of this code becomes wrong — the latency and bandwidth argument for <a href="implementation-plan.html#pivot">v2</a> does, and <a href="#relay-cost">the relay numbers below</a> say how much.
+  </div>
+
+  <div class="cards" data-c="verdict-cards">
+    <div class="card">
+      <h3>Proven</h3>
+      <p>A real HTTP client and a real <code>sshd</code> reached through the tunnel. 100 MiB byte-exact with matching digests. Two concurrent transfers that stayed independent. A real resolver answering real queries. Sessions reaped and their sockets returned, confirmed by <code>lsof</code>. The size cap failing loudly at a measured boundary. Both port allowlists refusing live services.</p>
+    </div>
+    <div class="card">
+      <h3>Not proven</h3>
+      <p>That the far end is a different machine — <code>hostname</code> is the same string on both sides of a one-Mac rig. That WireGuard completes a handshake through it: two <code>utun</code>s on one host fight over routes, so the substitute covers the sustained-flow half only.</p>
+    </div>
+    <div class="card">
+      <h3>Found by running it</h3>
+      <p>A fake green that passed every assertion while rtun carried nothing, a relay far too slow for the planned transfer sizes, and a port the plan picked that macOS already owns. All three are in <a href="#findings">findings</a>.</p>
+    </div>
+  </div>
+
+  <h2 id="status">Task status</h2>
+
+  <table data-c="status-table">
+    <thead><tr><th></th><th>Task</th><th>State</th><th>What the evidence shows</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">3.1</span></td>
+        <td>One connection end to end</td>
+        <td><span class="badge approval">partial</span></td>
+        <td>The far service's own uuid came back through the mapped port; <code>serve</code> logged <code>port=8022</code>; killing <code>connect</code> made the port stop answering while the service itself kept answering directly. <code>ssh</code> reached key exchange against the real far <code>sshd</code>. Cross-machine <code>hostname</code> still unavailable.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">3.2</span></td>
+        <td>Port allowlist on the serving side</td>
+        <td><span class="badge auto">done</span></td>
+        <td>Port 9999 ran a live second service throughout and still returned zero bytes (curl exit 52). Serve logged <code>refused: port not in --tcp port=9999</code>, connect logged <code>stream reset by peer: error 2</code>. Repeated for <code>--udp</code>.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">3.3</span></td>
+        <td>Concurrency and clean close</td>
+        <td><span class="badge auto">done</span></td>
+        <td>Two 50 MiB fetches in 0.90 s wall against 1.73 s of summed transfer time, so they overlapped rather than queued. 100 MiB at 121 MB/s. All three <code>sha256</code> digests matched at both ends.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">3.4</span></td>
+        <td>Re-verify on the relayed path</td>
+        <td><span class="badge auto">done</span></td>
+        <td><code>--relay-only</code> both sides, no <code>path=direct</code> line anywhere in either log. Token matched, all three digests matched. Sizes cut — see <a href="#relay-cost">below</a>.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">4.1</span></td>
+        <td>DNS round trip</td>
+        <td><span class="badge auto">done</span></td>
+        <td><code>dig</code> through the mapped port returned <code>ANSWER: 2</code> for <code>example.com</code>, and <code>dnsmasq</code> logged the query arriving. Two queries from two ephemeral source ports produced two sessions.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">4.2</span></td>
+        <td>WireGuard handshake</td>
+        <td><span class="badge approval">not run</span></td>
+        <td>Substitute only: 1086 datagrams of 1000 bytes over 60 s from one fixed source port, 0 lost, median RTT 1.31 ms, one session for the whole minute with no churn and no drops. No <code>wg show</code>, no handshake.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">4.3</span></td>
+        <td>Session reaping</td>
+        <td><span class="badge auto">done</span></td>
+        <td>Five source ports produced five sessions on both sides; <code>lsof</code> went 5 → 10 → 5 on the serve pid. Both sides logged <code>sessions=0 reaped=5</code>, and the next datagram opened session 6.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">4.4</span></td>
+        <td>Oversize datagram behaviour</td>
+        <td><span class="badge auto">done</span></td>
+        <td>1400 bytes crossed, 2000 and 8000 did not. <code>dropped datagram: datagram too large bytes=2000 cap=1408</code>. The far echo logged every size it received and never saw the oversize ones. The session stayed usable afterwards.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="built">What was built</h2>
+
+  <div class="diagram" data-c="diag-built">
+    <pre class="mermaid">
+flowchart LR
+  subgraph C["src/connect.rs — the connecting side"]
+    CT["TcpListener per --tcp<br/>bound before dialing"]
+    CU["UdpSocket per --udp<br/>sessions keyed by (src addr, port)"]
+  end
+  subgraph P["src/proto.rs"]
+    F["u16 target port on a stream<br/>u32 session + u16 port on a datagram"]
+  end
+  subgraph S["src/serve.rs — the serving side"]
+    ST["accept_bi, check --tcp,<br/>TcpStream to 127.0.0.1:port"]
+    SU["check --udp, one socket per<br/>session id, reply task each"]
+  end
+  CT ==> F ==> ST
+  CU -.-> F -.-> SU
+  ST --> SVC["sshd · http.server"]
+  SU --> RES["dnsmasq · udp echo"]
+    </pre>
+    <div class="caption">Hình 1 — Both directions of every stream are one <code>tokio::io::copy_bidirectional</code> over <code>join(recv, send)</code>, which is also what maps a stream FIN onto a TCP FIN. No custom pump loop was written.</div>
+  </div>
+
+  <table data-c="built-table">
+    <thead><tr><th>File</th><th>Added</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/proto.rs</code></td><td>New. Four functions: the two-byte stream header and the six-byte datagram prefix, plus a runt check that refuses anything shorter than the header.</td></tr>
+      <tr><td><code>src/connect.rs</code></td><td>Local TCP listeners and UDP sockets, all bound <em>before</em> the dial; one QUIC stream per accepted TCP connection; the session table keyed by <code>(source address, target port)</code>; the reply pump and the reaper.</td></tr>
+      <tr><td><code>src/serve.rs</code></td><td>The stream accept loop with the <code>--tcp</code> check, and the datagram pump with the <code>--udp</code> check; one dedicated socket per session id with its own reply task; the reaper.</td></tr>
+      <tr><td><code>src/tunnel.rs</code></td><td>The plan's five in-process cases. A bin crate cannot have <code>tests/tunnel.rs</code> import it, so it is a <code>#[cfg(test)]</code> module of the same name rather than an integration test.</td></tr>
+      <tr><td><code>src/main.rs</code></td><td><code>UDP_IDLE</code> (60 s) and <code>UDP_REAP_INTERVAL</code> (5 s); the port lists now reach <code>serve</code> as an <code>Offered</code> allowlist instead of being logged and discarded.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout" data-c="deps-callout">
+    <strong>One dependency added: <code>bytes</code>.</strong> <code>Connection::send_datagram</code> takes a <code>bytes::Bytes</code> and iroh does not re-export the type, so it has to be named. It was already in the tree transitively, so nothing new ships.
+  </div>
+
+  <h2 id="numbers">The numbers</h2>
+
+  <table data-c="numbers-table">
+    <thead><tr><th>Measurement</th><th>Direct path</th><th>Relayed path</th></tr></thead>
+    <tbody>
+      <tr><td>Bulk TCP throughput</td><td>121 MB/s (100 MiB in 0.86 s)</td><td>920 KB/s in the filed run; 134 KB/s in an earlier one</td></tr>
+      <tr><td>Establishment RTT</td><td>1.0–2.3 ms once direct</td><td>104–106 ms filed; up to 653 ms, and 0.9–5.9 s under load, earlier</td></tr>
+      <tr><td>UDP round trip, 1000-byte datagrams</td><td>median 1.31 ms, max 12.06 ms, 0/1086 lost</td><td>not measured</td></tr>
+      <tr><td>Datagram payload cap</td><td colspan="2">1408 bytes, measured — the plan estimated "roughly 1200 minus the 6-byte header"</td></tr>
+      <tr><td>Path upgrade</td><td colspan="2"><code>relayed</code> at establishment, <code>direct</code> 45–88 ms later across eight runs, consistent with <a href="p0-p2-results.html">2.1</a>'s 120–320 ms</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn" data-c="relay-cost" id="relay-cost">
+    <strong>The relay is two to three orders of magnitude slower than the direct path, and it is not consistent.</strong> 121 MB/s against 920 KB/s is 130×; against the 134 KB/s measured an hour earlier on the same rig it is 900×. That spread is itself the finding — the default relay is free shared infrastructure and its throughput is not something to plan around. The e2e plan's advice to cap the relayed bulk file at 10 MB was right and did not go far enough: the concurrent pair needs the same treatment. The first 3.4 attempt left them at 50 MiB each; after 300 seconds they had moved 35 MiB each and curl's own timeout killed them. This is the concrete cost behind <a href="wbs.html#p2">2.2</a>'s gate condition — "accept relayed operation" means accepting this number.
+  </div>
+
+  <h2 id="findings">Findings</h2>
+
+  <p>Three of these are about the harness rather than the product, which is the point of running checks against real binaries: the harness is where the lying happens.</p>
+
+  <table data-c="findings-table">
+    <thead><tr><th></th><th>Finding</th><th>Disposition</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge approval">1</span></td>
+        <td><strong>A fake green that passed every assertion while rtun carried nothing.</strong> Reading a run's output through <code>head</code> closed the pipe, <code>SIGPIPE</code> killed the script before its teardown, and a leftover <code>connect</code> from the previous run kept port 2222. The next run — <code>--relay-only</code> — failed to bind, exited, and the old <em>direct</em> tunnel served every byte. Token matched, digests matched, 121 MB/s "over the relay".</td>
+        <td>The harness now refuses to start if the mapped port is already held, requires an <code>established</code> line in this run's own <code>connect.log</code>, requires <code>stream opened</code> on the serving side before believing a transfer, and tears down through a <code>trap</code>. This is the sixth entry in the e2e plan's <a href="e2e-testing.html#traps">fake-green traps</a>, met in the wild.</td>
+      </tr>
+      <tr>
+        <td><span class="badge auto">2</span></td>
+        <td><strong>rtun made that failure visible rather than silent</strong>, because listeners are bound before the dial: the stale port produced <code>Error: binding tcp 127.0.0.1:2222 · Address already in use</code> and a non-zero exit, instead of a connected tunnel with nothing listening on it.</td>
+        <td>Working as designed. Worth keeping when 5.1 adds a retry loop — a bind failure is not something to retry.</td>
+      </tr>
+      <tr>
+        <td><span class="badge approval">3</span></td>
+        <td><strong>The plan's DNS port is unusable on macOS.</strong> <code>dnsmasq</code> on 5353 fails with <code>Address already in use</code>: <code>mDNSResponder</code> owns UDP 5353 systemwide, and <code>lsof</code> does not show it without root, so the cause is not obvious from the error.</td>
+        <td>4.1 runs on 15353 → 15354 instead. The e2e plan's <a href="e2e-testing.html#t41">4.1 procedure</a> should say so.</td>
+      </tr>
+      <tr>
+        <td><span class="badge approval">4</span></td>
+        <td><strong>Two of five streams logged <code>Connection reset by peer</code> at close on the relayed path — once, and not reproducibly.</strong> It appeared in the slow relayed run (134 KB/s) and not in the filed one (920 KB/s), which logged zero failures on either side. All digests matched in both, so no payload was lost either way; the reset lands after the body is delivered, when the local service closes with unread bytes still in its receive buffer.</td>
+        <td>Left as a <code>WARN</code> deliberately, and left unfixed. A close-time reset cannot be told from a mid-transfer reset by its error alone, so demoting it would hide the case that does lose data. Worth revisiting only if it starts appearing on the direct path, where it never has.</td>
+      </tr>
+      <tr>
+        <td><span class="badge auto">5</span></td>
+        <td><strong>The <code>--udp</code> port list is the same open door as <code>--tcp</code>, and the WBS has no task for it.</strong> Without the check, one allowlisted peer reaches every UDP port on the loopback interface.</td>
+        <td>Implemented and checked the same way — two live echoes, one offered. Filed as <code>evidence/local/3.2-udp/</code>. The <a href="wbs.html#p3">WBS</a> should fold it into 3.2's wording.</td>
+      </tr>
+      <tr>
+        <td><span class="badge approval">6</span></td>
+        <td><strong><code>connect</code> still exits 0 when the allowlist refuses it</strong> — carried over from <a href="p0-p2-results.html">P1.3</a> and untouched here.</td>
+        <td>Left alone on purpose: it is <a href="wbs.html#p5">5.1</a>'s task, and it is already written down there. Nothing in P3 or P4 depends on the exit status.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="ceilings">Ceilings, as observed</h2>
+
+  <table data-c="ceilings-table">
+    <thead><tr><th>Ceiling</th><th>What it measured</th></tr></thead>
+    <tbody>
+      <tr><td>UDP payload capped at the QUIC datagram size</td><td>1408 bytes on this path. 1400 crosses, 2000 is refused with the size and the cap both in the log line. The cap is whatever QUIC can carry at that moment, so it is not a constant to hard-code.</td></tr>
+      <tr><td>Idle sessions reaped on a timer</td><td>60 s idle, swept every 5 s, so a session outlives its last datagram by at most 65 s. One sweep for the whole table — per-session timers only matter once the table is large.</td></tr>
+      <tr><td>One peer connection at a time</td><td>Untouched. The serving side accepts many connections and gives each its own session table, but no check exercises two peers at once.</td></tr>
+      <tr><td>One global lock per session table</td><td>Never held across an <code>await</code>; the guard is bound out of the <code>match</code> so a slow socket cannot block the table. Adequate at 1084 datagrams/minute — unmeasured above that.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="checks">The in-process check</h2>
+
+  <p>All five cases from the plan's <a href="implementation-plan.html#testing">one check</a> now exist, plus two unit tests. Seven pass in 2.1 s with no network, no fixtures and no mocks.</p>
+
+  <table data-c="checks-table">
+    <thead><tr><th>Case</th><th>What would break it</th></tr></thead>
+    <tbody>
+      <tr><td><code>tcp_round_trip_is_byte_exact</code></td><td>Framing, stream routing, or a lost FIN — the test half-closes and reads to EOF, so a reply can only arrive if the close crossed and came back.</td></tr>
+      <tr><td><code>concurrent_tcp_connections_do_not_interleave</code></td><td>Streams crossing. Distinct fill bytes <em>and</em> distinct lengths, so neither a swap nor a partial cross reads as a pass.</td></tr>
+      <tr><td><code>udp_replies_reach_the_correct_local_source</code></td><td>A session table keyed wrongly: two local sockets send, and each must get its own payload back.</td></tr>
+      <tr><td><code>allowlist_admits_only_listed_peers</code></td><td>The peer allowlist. Moved here from <code>serve.rs</code> unchanged.</td></tr>
+      <tr><td><code>unoffered_tcp_port_is_refused</code></td><td>The port allowlist — <strong>and it was rewritten because the first version could not fail.</strong> It pointed at a dead port, so the stream failed whether or not the check existed. It now runs two live echo services and offers one.</td></tr>
+      <tr><td><code>datagram_round_trips_and_rejects_runts</code></td><td>The six-byte prefix, including the zero-length payload case and everything shorter than a header.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout" data-c="mutation-callout">
+    <strong>The port-allowlist case was mutation-checked.</strong> Replacing <code>if !tcp.contains(&amp;port)</code> with <code>if false</code> makes it fail; restoring it makes it pass. A check that has never been seen to fail is a check nobody has tested.
+  </div>
+
+  <h2 id="next">What to do next</h2>
+
+  <table data-c="next-table">
+    <thead><tr><th></th><th>Action</th></tr></thead>
+    <tbody>
+      <tr><td><span class="badge id">1</span></td><td><strong>Run 2.2.</strong> It was skipped to get here and it is still the only task that can invalidate the design. The relay numbers above are what "relayed only" now costs.</td></tr>
+      <tr><td><span class="badge id">2</span></td><td>Close 3.1 and 4.2 on a second machine: <code>hostname</code> differing inside the SSH session, and <code>wg show</code> reporting a handshake.</td></tr>
+      <tr><td><span class="badge id">3</span></td><td>Start P5 with the exit-status fix from <a href="wbs.html#p5">5.1</a>'s note — treat <code>ApplicationClosed</code> as terminal — before the retry loop exists to retry a permanent refusal forever.</td></tr>
+      <tr><td><span class="badge id">4</span></td><td>Fold the three doc corrections in: 4.1's port, 3.2's UDP half, and the relayed transfer sizes.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn" data-c="filing-callout">
+    <strong>One filing inconsistency left alone.</strong> The e2e plan says single-machine runs go under <code>evidence/local/&lt;id&gt;/</code> and <em>never</em> under <code>evidence/&lt;id&gt;/</code>. P0–P2 filed several tasks in both places. P3–P4 follow the stricter rule — everything under <code>local/</code>, with the ledger naming which tasks close on it. Reconciling P0–P2 is a five-minute job for whoever cares more about the shelf than about the next phase.
+  </div>
+
+  </main>
+
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    document.querySelectorAll('.diagram').forEach((d) => {
+      const pre = d.querySelector('pre.mermaid');
+      if (pre) d.dataset.mermaidSrc = pre.textContent;
+    });
+    mermaid.initialize({ startOnLoad: true, theme: 'dark', themeVariables: { darkMode: true, background: '#181b22' } });
+  </script>
+  <script type="module" src="https://htmldoc.wfomobile.com/htmldoc.js"></script>
+</body>
+</html>

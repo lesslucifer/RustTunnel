@@ -2,7 +2,10 @@
 //! direct hole-punched QUIC connection. See docs/implementation-plan.html.
 
 mod connect;
+mod proto;
 mod serve;
+#[cfg(test)]
+mod tunnel;
 
 use std::{env, fs, path::PathBuf, str::FromStr};
 
@@ -175,6 +178,13 @@ fn path_kind(addr: &iroh::TransportAddr) -> &'static str {
 /// enough that a log answers "was it still direct at 03:00" without inference.
 const PATH_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// A UDP session — and on the serving side its socket — is released after this much
+/// silence in both directions. The session id is the only state either side keeps.
+pub const UDP_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+/// ponytail: one sweep for the whole table, so a session lives up to a tick past
+/// `UDP_IDLE`. Per-session timers only matter if the table gets large.
+pub const UDP_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn log_selected(conn: &Connection, msg: &'static str) {
     let peer = conn.remote_id().fmt_short();
     let paths = conn.paths();
@@ -230,19 +240,11 @@ async fn main() -> Result<()> {
         }
         Cmd::Serve { tcp, udp, allow, relay_only } => {
             let ep = bind_endpoint(relay_only, vec![ALPN.to_vec()]).await?;
-            // ponytail: the port lists are the serve-side allowlist; they are
-            // enforced once there is a data plane to enforce them on (P3/P4).
-            info!(?tcp, ?udp, "offered ports");
-            serve::run(ep, allow).await
+            serve::run(ep, allow, serve::Offered { tcp, udp }).await
         }
         Cmd::Connect { peer, tcp, udp, relay_only } => {
             let ep = bind_endpoint(relay_only, vec![]).await?;
-            info!(
-                tcp = ?tcp.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
-                udp = ?udp.iter().map(|m| m.to_string()).collect::<Vec<_>>(),
-                "port mappings"
-            );
-            connect::run(ep, peer).await
+            connect::run(ep, peer.into(), tcp, udp).await
         }
     }
 }

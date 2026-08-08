@@ -1,4 +1,4 @@
-# Evidence ledger — P0, P1, P2
+# Evidence ledger — P0 through P4
 
 Convention and definition of done live in [docs/wbs.html](../docs/wbs.html). A task is
 done when the target is observably true, the check ran against real binaries, the
@@ -22,6 +22,34 @@ against the public n0 relay `aps1-1.relay.n0.iroh.link`.
 | 2.1 Path reporting | **done** | `2.1/session.txt` |
 | 2.2 Cross-NAT direct connection | **not run — needs a second network** | see below |
 | 2.3 Relay fallback works | **done** | `2.3/{session.txt,serve.log,connect.log}` |
+| 3.1 One connection end to end | **partial — one machine only** | `local/3.1/` |
+| 3.2 Port allowlist on the serving side | **done** | `local/3.2/`, plus `local/3.2-udp/` |
+| 3.3 Concurrency and clean close | **done** | `local/3.3/` |
+| 3.4 Re-verify on the relayed path | **done** | `local/3.4/` |
+| 4.1 DNS round trip | **done** | `local/4.1/` |
+| 4.2 WireGuard handshake | **not run — substitute only** | `local/4.2-substitute/` |
+| 4.3 Session reaping | **done** | `local/4.3/` |
+| 4.4 Oversize datagram behaviour | **done** | `local/4.4/` |
+
+P3 and P4 were run on one machine, so every run is filed under `local/` per the
+[filing rules](../docs/e2e-testing.html) — including the seven the coverage matrix marks
+full fidelity, where the substitution costs nothing and the local run *is* the check.
+`local/harness/` holds the scripts, so any of it can be re-run verbatim. Results and the
+findings each check produced: [docs/p3-p4-results.html](../docs/p3-p4-results.html).
+
+## 3.1 and 4.2 — what is left
+
+3.1's evidence line wants "the local hostname before connecting and the remote hostname
+inside the session". One machine has one hostname. The token check filed instead is
+stronger about the byte path and silent about reaching another host; the `ssh` run
+reaches key exchange against the real far `sshd` and stops at authentication, which needs
+a keypair this run did not install.
+
+4.2 wants `wg show` reporting a recent handshake and a ping crossing the interface. Two
+`utun`s on one host compete for routes to the same address space, so a failure would be
+as likely to be macOS routing as rtun. The substitute covers what 4.2 adds over 4.1 —
+sustained bidirectional flow from a fixed source port near the size cap — and nothing
+more. Both close on a second machine, not here.
 
 ## 0.2 — what is left
 
