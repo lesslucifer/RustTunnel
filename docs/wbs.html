@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en" data-htmldoc-id="6a7708bf9f34851f0dfab201">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RustTunnel — Work Breakdown Structure</title>
+</head>
+<body>
+  <header class="doc-hero">
+    <div class="inner">
+      <h1>RustTunnel — Work Breakdown Structure</h1>
+      <p>Every task carries a target, an end-to-end check, and a filed piece of evidence. Nothing is done until all three exist.</p>
+      <div class="meta">Draft v1 · 2026-08-08 · RustTunnel</div>
+    </div>
+  </header>
+
+  <main>
+
+  <h2 id="how-to-read">How to read this</h2>
+
+  <p>The design lives in the <a href="implementation-plan.html">implementation plan</a>. This document is the execution track: what gets built, in what order, and — the part that matters — how each piece is proven to work against a real network rather than against an assumption.</p>
+
+  <div class="cards" data-c="contract-cards">
+    <div class="card">
+      <h3>Target</h3>
+      <p>One sentence describing the observable state that makes the task done. Not "implement X" — a condition you can stand in front of and check.</p>
+    </div>
+    <div class="card">
+      <h3>E2E check</h3>
+      <p>Exercised through the real binary, over a real network, using a real client. No unit tests here, no mocks, no in-process shortcuts.</p>
+    </div>
+    <div class="card">
+      <h3>Evidence</h3>
+      <p>A file committed under <code>evidence/&lt;task-id&gt;/</code>. If it was not captured, the task is not done — memory of a passing test is not evidence.</p>
+    </div>
+  </div>
+
+  <div class="callout" data-c="e2e-definition-callout">
+    <strong>What "end-to-end" means here.</strong> A real <code>ssh</code>, <code>dig</code> or <code>wg</code> talking to a real service on the far machine, through two <code>rtun</code> processes, over a network path neither process controls. The five in-process cases in the plan's <a href="implementation-plan.html#testing">one check</a> are a fast regression net that runs in CI — they are necessary and they are not sufficient. Loopback cannot prove NAT traversal, because there is nothing to traverse.
+  </div>
+
+  <h3 id="evidence-convention">Evidence convention</h3>
+
+  <table data-c="evidence-table">
+    <thead><tr><th>Kind</th><th>Filed as</th><th>Must contain</th></tr></thead>
+    <tbody>
+      <tr><td>Terminal transcript</td><td><code>evidence/&lt;id&gt;/session.txt</code></td><td>The full command line and its output, unedited. Redact keys only if genuinely secret — endpoint IDs are public and should stay readable.</td></tr>
+      <tr><td>Process log</td><td><code>evidence/&lt;id&gt;/serve.log</code>, <code>connect.log</code></td><td>Both sides, with timestamps. A one-sided log proves half a story.</td></tr>
+      <tr><td>Network context</td><td>first lines of <code>session.txt</code></td><td>Which two networks, and how they differ. "Both on my Wi-Fi" invalidates most of Phase 2.</td></tr>
+      <tr><td>Screenshot</td><td><code>evidence/&lt;id&gt;/*.png</code></td><td>Only where text cannot carry it — a CI run page, a Windows service dialog.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="phases">Phase overview</h2>
+
+  <div class="diagram" data-c="diag-phases">
+    <pre class="mermaid">
+flowchart TD
+  P0["P0 · Foundation<br/>it builds everywhere"]
+  P1["P1 · Identity<br/>two endpoints meet"]
+  P2["P2 · Direct path<br/>RISK GATE"]
+  P3["P3 · TCP forwarding"]
+  P4["P4 · UDP forwarding"]
+  P5["P5 · Resilience"]
+  P6["P6 · Ship"]
+  STOP["Premise dead.<br/>Reconsider before writing<br/>a data plane."]
+  P0 --> P1 --> P2
+  P2 -->|"direct confirmed"| P3
+  P2 -.->|"relayed only, both networks"| STOP
+  P3 --> P4 --> P5 --> P6
+    </pre>
+    <div class="caption">Hình 1 — P2 sits before the data plane on purpose. It is the only phase that can invalidate the design, so it is the cheapest one to fail.</div>
+  </div>
+
+  <table data-c="phase-table">
+    <thead><tr><th></th><th>Phase</th><th>What it proves</th><th>Rough size</th></tr></thead>
+    <tbody>
+      <tr><td><span class="badge id">P0</span></td><td>Foundation</td><td>The code compiles on all three operating systems, today, before anything depends on that.</td><td>Half a day</td></tr>
+      <tr><td><span class="badge id">P1</span></td><td>Identity</td><td>Two machines find each other by public key, and the wrong key is turned away.</td><td>1–2 days</td></tr>
+      <tr><td><span class="badge id">P2</span></td><td>Direct path <span class="badge approval">gate</span></td><td>A hole-punched connection actually forms between your two real networks.</td><td>Half a day, or the project changes</td></tr>
+      <tr><td><span class="badge id">P3</span></td><td>TCP forwarding</td><td>Real TCP clients work through the tunnel, concurrently, without corruption.</td><td>2–3 days</td></tr>
+      <tr><td><span class="badge id">P4</span></td><td>UDP forwarding</td><td>Real UDP protocols work, and session state does not grow without bound.</td><td>2–3 days</td></tr>
+      <tr><td><span class="badge id">P5</span></td><td>Resilience</td><td>It survives sleep, network switches, restarts and a day of uptime unattended.</td><td>2 days plus soak time</td></tr>
+      <tr><td><span class="badge id">P6</span></td><td>Ship</td><td>A person who is not the build machine can install and run it on any of the three platforms.</td><td>2 days</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="p0">P0 — Foundation</h2>
+
+  <table data-c="p0-table">
+    <thead><tr><th></th><th>Deliverable</th><th>Target</th><th>E2E check</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">0.1</span></td>
+        <td>Repo skeleton and toolchain</td>
+        <td>A release build succeeds on the dev Mac and the CLI exposes <code>serve</code>, <code>connect</code> and <code>id</code>.</td>
+        <td>Run the built binary's <code>--help</code> and each subcommand's <code>--help</code>.</td>
+        <td><code>0.1/session.txt</code> — build tail plus all four help outputs.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">0.2</span></td>
+        <td>Three-platform build check in CI</td>
+        <td><code>cargo build</code> and <code>cargo test</code> pass on Linux, macOS and Windows runners.</td>
+        <td>Push a branch; all three jobs go green without a local machine involved.</td>
+        <td><code>0.2/ci-run.png</code> plus the run URL in <code>session.txt</code>.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout" data-c="p0-callout">
+    <strong>Why the Windows runner exists this early.</strong> It costs an hour now and catches a platform-specific break the day it lands. Discovering at P6 that a core dependency does not build on Windows means unwinding weeks of decisions. This is the cheapest insurance in the plan.
+  </div>
+
+  <h2 id="p1">P1 — Identity</h2>
+
+  <table data-c="p1-table">
+    <thead><tr><th></th><th>Deliverable</th><th>Target</th><th>E2E check</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">1.1</span></td>
+        <td>Persistent identity and <code>rtun id</code></td>
+        <td>The endpoint ID is stable across restarts; the key file is owner-readable only.</td>
+        <td>Print the ID, restart, print again — identical. Delete the state directory, print again — different. Check file permissions.</td>
+        <td><code>1.1/session.txt</code> showing all three IDs and the permission bits.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">1.2</span></td>
+        <td>Dial by endpoint ID</td>
+        <td><code>connect</code> establishes a connection to <code>serve</code> given only its ID, from a different machine.</td>
+        <td>Two machines, two terminals. Each side logs the other's ID; the IDs match what <code>rtun id</code> printed.</td>
+        <td><code>1.2/serve.log</code> and <code>connect.log</code> from both machines.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">1.3</span></td>
+        <td>Peer allowlist</td>
+        <td>A peer whose key is not in <code>--allow</code> is refused; a listed peer is admitted.</td>
+        <td>Connect with an unlisted key — refused, with a message naming the rejected key. Add it, retry — admitted.</td>
+        <td><code>1.3/session.txt</code> with both attempts, and the serve-side log line for the rejection.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="p2">P2 — Direct path <span class="badge approval">risk gate</span></h2>
+
+  <p>This phase decides whether the project as designed is possible on the networks you actually have. It is three tasks and half a day, and it comes before any forwarding code exists.</p>
+
+  <table data-c="p2-table">
+    <thead><tr><th></th><th>Deliverable</th><th>Target</th><th>E2E check</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">2.1</span></td>
+        <td>Path reporting</td>
+        <td>Both sides log <code>path=direct</code> or <code>path=relayed</code> on establishment, and log again when the path upgrades.</td>
+        <td>Run both roles on one machine — reports direct immediately, with no relay in between.</td>
+        <td><code>2.1/session.txt</code>.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">2.2</span></td>
+        <td><strong>Cross-NAT direct connection</strong></td>
+        <td><code>path=direct</code> between two machines on two genuinely different networks.</td>
+        <td>Home box on the home ISP, laptop tethered to a phone on cellular. Both sides must independently report direct.</td>
+        <td><code>2.2/serve.log</code>, <code>connect.log</code>, and a first line in <code>session.txt</code> naming both networks and both carriers.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">2.3</span></td>
+        <td>Relay fallback works</td>
+        <td>With direct paths disabled, the connection still establishes and stays up.</td>
+        <td>Force relay mode, connect, hold the link for five minutes, confirm it does not drop.</td>
+        <td><code>2.3/connect.log</code> showing <code>path=relayed</code> at both ends of the window.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn" data-c="p2-gate-callout">
+    <strong>Gate condition.</strong> If 2.2 reports <code>relayed</code> between your two real networks, hole punching is not available to you and the entire premise of v2 is unavailable — stop and reconsider before building a data plane on it. Try a third network first, because one symmetric NAT is survivable and two are not; if it still fails, the honest options are to keep <a href="implementation-plan.html#pivot">v1's relay design</a> or to accept relayed operation and lose the latency and bandwidth argument that motivated the pivot. Do not proceed to P3 on a relayed-only result and hope.
+  </div>
+
+  <h2 id="p3">P3 — TCP forwarding</h2>
+
+  <table data-c="p3-table">
+    <thead><tr><th></th><th>Deliverable</th><th>Target</th><th>E2E check</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">3.1</span></td>
+        <td>One connection end to end</td>
+        <td>An interactive SSH session runs through the tunnel to the far machine.</td>
+        <td><code>ssh -p 2222 127.0.0.1</code> on the laptop reaches the home box. Run <code>hostname</code> and <code>uptime</code> inside the session to prove it is the remote host, not the local one.</td>
+        <td><code>3.1/session.txt</code> showing the local hostname before connecting and the remote hostname inside the session.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">3.2</span></td>
+        <td>Port allowlist on the serving side</td>
+        <td>A stream naming a port that <code>serve</code> did not offer is refused.</td>
+        <td>Map a local port to a remote port absent from <code>serve --tcp</code>; the connection is refused and the reason is logged.</td>
+        <td><code>3.2/session.txt</code> plus the serve-side rejection line.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">3.3</span></td>
+        <td>Concurrency and clean close</td>
+        <td>Simultaneous connections stay independent, and closes propagate in both directions.</td>
+        <td>Two concurrent sessions carrying distinct payloads that must not interleave, plus a 100 MB file transferred and checksummed at both ends.</td>
+        <td><code>3.3/session.txt</code> with matching <code>sha256</code> on both sides and both session transcripts.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">3.4</span></td>
+        <td>Re-verify on the relayed path</td>
+        <td>Everything in 3.1 and 3.3 also works with direct paths disabled.</td>
+        <td>Force relay mode and repeat the two checks.</td>
+        <td><code>3.4/session.txt</code>.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="p4">P4 — UDP forwarding</h2>
+
+  <table data-c="p4-table">
+    <thead><tr><th></th><th>Deliverable</th><th>Target</th><th>E2E check</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">4.1</span></td>
+        <td>DNS round trip</td>
+        <td>A real resolver on the far side answers a real query through the tunnel.</td>
+        <td><code>dig</code> against the local forwarded port returns a populated ANSWER section for a known name.</td>
+        <td><code>4.1/session.txt</code> with the full <code>dig</code> output.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">4.2</span></td>
+        <td>WireGuard handshake</td>
+        <td>A WireGuard peer completes a handshake and passes traffic through the tunnel.</td>
+        <td><code>wg show</code> reports a recent handshake, and a ping crosses the WireGuard interface.</td>
+        <td><code>4.2/session.txt</code> with <code>wg show</code> and ping statistics.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">4.3</span></td>
+        <td>Session reaping</td>
+        <td>Idle UDP sessions and their sockets are released; the table returns to empty.</td>
+        <td>Open several sessions from distinct source ports, stop sending, wait past the idle timeout, and read the session count back.</td>
+        <td><code>4.3/session.txt</code> showing the count before, during and after the timeout.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">4.4</span></td>
+        <td>Oversize datagram behaviour</td>
+        <td>A datagram larger than the cap is dropped predictably and visibly, not silently corrupted.</td>
+        <td>Send a 2 KB datagram; confirm it does not arrive and that the drop is logged with the reason.</td>
+        <td><code>4.4/session.txt</code> plus the log line.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout" data-c="p4-callout">
+    <strong>4.4 tests a known ceiling, not a bug.</strong> The <a href="implementation-plan.html#ceilings">datagram size cap</a> is a deliberate simplification. The check exists so the limit fails loudly and legibly at the boundary, rather than presenting as an application that mysteriously misbehaves under load.
+  </div>
+
+  <h2 id="p5">P5 — Resilience</h2>
+
+  <table data-c="p5-table">
+    <thead><tr><th></th><th>Deliverable</th><th>Target</th><th>E2E check</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">5.1</span></td>
+        <td>Reconnect with backoff</td>
+        <td>The connecting side retries with growing delay and recovers by itself when the far side returns.</td>
+        <td>Kill <code>serve</code>, watch the retries, restart it after a few minutes, then open a fresh SSH session successfully.</td>
+        <td><code>5.1/connect.log</code> — timestamps must show the backoff growing, then a successful reconnect.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">5.2</span></td>
+        <td>Survives a network change</td>
+        <td>The tunnel recovers unattended across laptop sleep and a Wi-Fi to cellular switch.</td>
+        <td>Sleep the laptop five minutes and wake it. Separately, switch it from Wi-Fi to tethering mid-session. No manual restart in either case.</td>
+        <td><code>5.2/connect.log</code> covering both transitions, and the post-recovery path type.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">5.3</span></td>
+        <td>24-hour soak</td>
+        <td>Both processes survive a day of light periodic traffic with no memory growth and no death.</td>
+        <td>Run a small transfer every few minutes for 24 hours; sample resident memory hourly.</td>
+        <td><code>5.3/soak.txt</code> — hourly memory samples and final uptime for both processes.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn" data-c="p5-callout">
+    <strong>5.2 is where laptops actually break.</strong> Sleep and network switches are the normal operating conditions of the machine this runs on, not edge cases. A tunnel that needs a manual restart after every lid close is a tunnel nobody keeps using — which makes this the phase that decides whether the tool survives contact with daily use.
+  </div>
+
+  <h2 id="p6">P6 — Ship</h2>
+
+  <table data-c="p6-table">
+    <thead><tr><th></th><th>Deliverable</th><th>Target</th><th>E2E check</th><th>Evidence</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">6.1</span></td>
+        <td>Release artifacts</td>
+        <td>A tag push produces binaries for all target platforms, with checksums.</td>
+        <td>Push a tag; the release appears with every expected artifact attached.</td>
+        <td><code>6.1/release.png</code> plus the release URL and the artifact list.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">6.2</span></td>
+        <td>Install on a clean machine</td>
+        <td>The published installer works on a machine that has never held the source or a toolchain.</td>
+        <td>On a fresh VM or a fresh user account per OS: run the installer, then <code>rtun id</code>.</td>
+        <td><code>6.2/&lt;os&gt;-session.txt</code> for each platform, starting from the install command.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">6.3</span></td>
+        <td>Runs as a service, survives reboot</td>
+        <td>The tunnel comes back after a reboot with no human action, on each platform.</td>
+        <td>Install the service, reboot, and confirm from the far side that the tunnel is up before anyone touches the machine.</td>
+        <td><code>6.3/&lt;os&gt;-session.txt</code> — the far side's log showing reconnection, timestamped after the reboot.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">6.4</span></td>
+        <td>Pairing walkthrough</td>
+        <td>A person following written steps can pair two machines without reading the source.</td>
+        <td>Hand the steps to someone else, or to yourself on an unfamiliar machine, and follow them literally.</td>
+        <td><code>6.4/session.txt</code> plus a note of every step that needed improvisation.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout" data-c="p6-callout">
+    <strong>6.4 is the only task with a human in the loop, and it is not optional.</strong> The <a href="implementation-plan.html#packaging-bootstrap">pairing flow</a> requires reading an ID off one machine and passing it to another, in both directions. That is exactly the kind of step that is obvious to whoever designed it and confusing to everyone else. Every improvisation the check records is a documentation bug.
+  </div>
+
+  <h2 id="done">Definition of done</h2>
+
+  <p>A task is done when all four hold. Three out of four is an in-progress task, regardless of how finished the code feels.</p>
+
+  <table data-c="dod-table">
+    <thead><tr><th></th><th>Condition</th></tr></thead>
+    <tbody>
+      <tr><td><span class="badge id">1</span></td><td>The target is observably true, checked by the person claiming it.</td></tr>
+      <tr><td><span class="badge id">2</span></td><td>The E2E check ran against real binaries over a real network, with no mocks or in-process shortcuts.</td></tr>
+      <tr><td><span class="badge id">3</span></td><td>Evidence is committed under <code>evidence/&lt;task-id&gt;/</code>, unedited, showing both sides where two sides exist.</td></tr>
+      <tr><td><span class="badge id">4</span></td><td>The in-process regression check still passes, so the new work did not break the old.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn" data-c="dod-callout">
+    <strong>Evidence is a gate, not paperwork.</strong> The whole design rests on claims about NAT behaviour, sleep recovery and cross-platform installs — none of which can be confirmed by reading the code, and all of which will be re-litigated in three months when something breaks. A captured log answers "did this ever actually work" in seconds. A memory of it does not.
+  </div>
+
+  </main>
+
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    document.querySelectorAll('.diagram').forEach((d) => {
+      const pre = d.querySelector('pre.mermaid');
+      if (pre) d.dataset.mermaidSrc = pre.textContent;
+    });
+    mermaid.initialize({ startOnLoad: true, theme: 'dark', themeVariables: { darkMode: true, background: '#181b22' } });
+  </script>
+  <script type="module" src="https://htmldoc.wfomobile.com/htmldoc.js"></script>
+</body>
+</html>

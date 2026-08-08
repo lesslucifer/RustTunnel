@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en" data-htmldoc-id="6a76fd8d9f34851f0dfab1e0">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RustTunnel — Implementation Plan</title>
+</head>
+<body>
+  <header class="doc-hero">
+    <div class="inner">
+      <h1>RustTunnel — Implementation Plan</h1>
+      <p>A single-binary Rust CLI that forwards TCP and UDP ports between two machines you own, over a direct hole-punched QUIC connection.</p>
+      <div class="meta">Draft v2 · 2026-08-08 · RustTunnel</div>
+    </div>
+  </header>
+
+  <main>
+
+  <h2 id="scope">Scope</h2>
+
+  <p>RustTunnel connects <strong>two machines you control</strong>, each of which may be behind NAT, and forwards a configured list of TCP and UDP ports between them. The connection is <em>direct</em> whenever the network permits it — traffic does not pass through any third party.</p>
+
+  <div class="cards" data-c="scope-cards">
+    <div class="card">
+      <h3>What it is</h3>
+      <p>Run <code>rtun</code> on both ends. One side offers local ports, the other side reaches them on its own loopback. Dial by public key, not by address.</p>
+    </div>
+    <div class="card">
+      <h3>What it is not</h3>
+      <p>No virtual IPs, no TUN device, no root, no mesh, no public ingress. An unmodified peer running plain <code>ssh</code> or a browser cannot reach you — only machines running <code>rtun</code> can.</p>
+    </div>
+  </div>
+
+  <div class="callout" data-c="scope-callout">
+    <strong>The trade being made:</strong> both ends must run our software, because hole punching is something two programs do <em>to each other</em>. In exchange, the common case has no relay in the data path — no rented bandwidth, no third party holding your bytes, and latency is the direct path rather than a detour.
+  </div>
+
+  <h2 id="pivot">What changed from v1</h2>
+
+  <p>v1 of this plan was a <em>relay</em>: a VPS with a public IP accepted all inbound traffic and forwarded it down a tunnel. Every byte crossed the VPS twice, the VPS terminated TLS and therefore saw plaintext, and bandwidth was the dominant cost.</p>
+
+  <p>v2 removes the relay from the data path. The cost of that removal is stated plainly in <a href="#scope">Scope</a>: the far peer must run <code>rtun</code>. That single requirement is what makes everything else possible.</p>
+
+  <table data-c="pivot-table">
+    <thead><tr><th></th><th>v1 — relay</th><th>v2 — direct</th></tr></thead>
+    <tbody>
+      <tr><td>Data path</td><td>Always through the VPS</td><td>Direct, ~90% of the time; relayed fallback otherwise</td></tr>
+      <tr><td>Peer requirement</td><td>Nothing — plain <code>ssh</code> works</td><td>Must run <code>rtun</code></td></tr>
+      <tr><td>Public ingress</td><td>Yes — <code>ssh -p 2222 vps.example.com</code></td><td>No. This is the thing that is genuinely lost.</td></tr>
+      <tr><td>Who sees plaintext</td><td>The VPS, unavoidably</td><td>Nobody. End-to-end between the two endpoint keys.</td></tr>
+      <tr><td>Server cost</td><td>Metered egress on every byte</td><td>Kilobytes per handshake, or a free public service</td></tr>
+      <tr><td>Secrets out of band</td><td>Shared token + certificate fingerprint</td><td>Two public keys. Nothing secret travels.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="why-direct">How a direct connection is possible</h2>
+
+  <p>A machine behind NAT has no address anyone can dial — that much was true in v1 and is still true. What v1 missed is that the problem is only unsolvable in <em>one</em> direction. If both machines dial <em>out</em> at the same moment, each one's outbound packet creates the NAT mapping that lets the other one's packet in. Neither side ever accepts an unsolicited inbound packet; both sides think they initiated.</p>
+
+  <div class="diagram" data-c="diag-punch">
+    <pre class="mermaid">
+sequenceDiagram
+  participant A as Machine A behind NAT A
+  participant B as Broker with public IP
+  participant C as Machine C behind NAT C
+  A->>B: I am here, my observed address is 1.2.3.4:41000
+  C->>B: I am here, my observed address is 5.6.7.8:52000
+  B-->>A: C is at 5.6.7.8:52000
+  B-->>C: A is at 1.2.3.4:41000
+  Note over A,C: both now fire outbound, simultaneously
+  A->>C: UDP to 5.6.7.8:52000 (opens NAT A's mapping)
+  C->>A: UDP to 1.2.3.4:41000 (opens NAT C's mapping)
+  Note over A,C: each mapping now admits the other's packets
+  A->>C: QUIC handshake, direct
+  Note over B: broker drops out of the path entirely
+    </pre>
+    <div class="caption">Hình 1 — Simultaneous open. The broker never carries payload; it only tells each side where the other appeared to come from.</div>
+  </div>
+
+  <p>The broker is unavoidable and small. Neither machine can learn its own public address, or the other's, without asking something that already has one. But that exchange is a few kilobytes once per connection, not a bandwidth line item.</p>
+
+  <h3 id="why-direct-fails">When it does not work</h3>
+
+  <p>Hole punching depends on the NAT reusing the same external port for packets to different destinations. Most NATs do. <strong>Symmetric NAT</strong> does not — it picks a fresh external port per destination, so the address the broker observed is not the address the far side must send to. Two symmetric NATs facing each other cannot be punched at all.</p>
+
+  <table data-c="punch-table">
+    <thead><tr><th>Situation</th><th>Outcome</th></tr></thead>
+    <tbody>
+      <tr><td>Both on the same LAN</td><td>Direct, discovered locally. Never leaves the switch.</td></tr>
+      <tr><td>Either side has a real public IP or working IPv6</td><td>Direct, trivially.</td></tr>
+      <tr><td>Ordinary home / office NAT on both sides</td><td>Direct, via the punch above.</td></tr>
+      <tr><td>Router speaks UPnP-IGD, NAT-PMP or PCP</td><td>Direct — just ask the router for a mapping.</td></tr>
+      <tr><td>Symmetric NAT on one side</td><td>Usually still direct. The non-symmetric side is punchable.</td></tr>
+      <tr><td><strong>Symmetric NAT on both sides</strong></td><td><strong>Relayed.</strong> Carrier CGNAT and some corporate networks. No amount of cleverness fixes this.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn" data-c="fallback-callout">
+    <strong>A relay fallback is not optional.</strong> Roughly one connection in ten cannot be punched. Without a fallback those connections simply fail, with no diagnostic the user can act on. The fallback exists so that "it works" does not carry an asterisk — and because the traffic is end-to-end encrypted, falling back costs privacy nothing.
+  </div>
+
+  <h2 id="architecture">Architecture</h2>
+
+  <div class="diagram" data-c="diag-arch">
+    <pre class="mermaid">
+flowchart LR
+  subgraph laptop["Laptop behind NAT — rtun connect"]
+    L1["listens 127.0.0.1:2222"]
+    L2["listens 127.0.0.1:51820"]
+  end
+  subgraph infra["Broker and relay — public"]
+    BR["address discovery<br/>plus relay fallback"]
+  end
+  subgraph home["Home box behind NAT — rtun serve"]
+    H1["sshd :22"]
+    H2["wireguard :51820"]
+  end
+  L1 -.->|"handshake only"| BR
+  BR -.->|"handshake only"| H1
+  L1 ==>|"direct QUIC, hole punched"| H1
+  L2 ==>|"direct QUIC, hole punched"| H2
+    </pre>
+    <div class="caption">Hình 2 — The dotted path carries setup only and then goes quiet. The solid path carries all payload and touches no third party.</div>
+  </div>
+
+  <p>Note the inversion from v1: the listening sockets now live on the <strong>connecting</strong> machine's loopback, not on a public host. <code>ssh -p 2222 127.0.0.1</code> on the laptop reaches <code>sshd</code> on the home box.</p>
+
+  <h2 id="transport">Transport decision: iroh</h2>
+
+  <p>QUIC is still the right transport, for the reasons v1 gave — one stream per tunnelled connection so a loss on one does not stall the others, native unreliable datagrams for UDP, and TLS 1.3 built in. What changes is that we no longer drive <code>quinn</code> directly.</p>
+
+  <p><a href="https://github.com/n0-computer/iroh">iroh</a> is <code>quinn</code> plus the entire NAT-traversal problem, as one dependency. It reached 1.0 and hands the application an ordinary QUIC <code>Connection</code> — the data-plane code below is written against that, unaware of how the connection was obtained.</p>
+
+  <table data-c="iroh-table">
+    <thead><tr><th>Problem</th><th>Hand-rolled</th><th>iroh</th></tr></thead>
+    <tbody>
+      <tr><td>Learning your own public address</td><td>STUN client, plus a STUN server to run</td><td>Built in</td></tr>
+      <tr><td>Exchanging candidates</td><td>A signalling protocol and a server to host it</td><td>Built in, public infrastructure available</td></tr>
+      <tr><td>The punch itself</td><td>Simultaneous open, retries, path validation, race handling</td><td>Built in</td></tr>
+      <tr><td>Router port mapping</td><td>UPnP-IGD, NAT-PMP and PCP clients</td><td>Built in</td></tr>
+      <tr><td>Same-LAN shortcut</td><td>mDNS discovery</td><td>Built in</td></tr>
+      <tr><td>Relay fallback</td><td>Write and host a relay</td><td>Built in, self-hostable</td></tr>
+      <tr><td>Peer identity</td><td>Certificate generation and pinning</td><td>The public key <em>is</em> the TLS identity</td></tr>
+    </tbody>
+  </table>
+
+  <p>Every row is a week we are not spending. The alternatives were considered and rejected: <code>libp2p</code> brings a peer-to-peer worldview far larger than a port forwarder needs, and <code>webrtc-rs</code> drags in SDP and the full ICE stack to reach the same place.</p>
+
+  <h3 id="transport-api">The shape of it</h3>
+
+  <pre><code>// the machine offering ports
+let ep = Endpoint::builder(presets::N0)
+    .alpns(vec![b"rtun/0".to_vec()])
+    .secret_key(persisted_key)
+    .bind().await?;
+let conn = ep.accept().await?.await?;
+
+// the machine reaching them
+let ep = Endpoint::bind(presets::N0).await?;
+let conn = ep.connect(endpoint_id, b"rtun/0").await?;</code></pre>
+
+  <p>After those four lines the connection is a QUIC connection. <code>open_bi</code>, <code>accept_bi</code>, <code>send_datagram</code> and <code>read_datagram</code> behave exactly as they would on raw <code>quinn</code>.</p>
+
+  <div class="callout warn" data-c="secretkey-callout">
+    <strong>Persist the secret key on first run.</strong> The endpoint's identity <em>is</em> its keypair. Generate one on first run and write it to the state directory with mode <code>600</code>; if it is regenerated each start, the endpoint ID changes, every allowlist entry pointing at it goes stale, and the far side correctly refuses to connect.
+  </div>
+
+  <h2 id="establishment">Connection establishment</h2>
+
+  <p>Setup goes through the relay so the two sides can talk before they can talk directly; the punch happens underneath and the path upgrades in place. Nothing above the QUIC layer observes the switch.</p>
+
+  <div class="diagram" data-c="diag-establish">
+    <pre class="mermaid">
+sequenceDiagram
+  participant C as rtun connect
+  participant R as Relay plus discovery
+  participant S as rtun serve
+  Note over S: on start, registers home relay and observed addresses
+  C->>R: resolve endpoint id to relay url and candidate addresses
+  C->>R: QUIC handshake, relayed
+  R->>S: forwarded
+  S-->>C: connection established, currently relayed
+  Note over C,S: allowlist check on the serve side, drop if the peer key is unknown
+  par hole punch, concurrent with traffic
+    C->>S: probe candidate addresses directly
+  and
+    S->>C: probe candidate addresses directly
+  end
+  Note over C,S: direct path validated, QUIC migrates to it
+  Note over R: relay is no longer in the data path
+    </pre>
+    <div class="caption">Hình 3 — Traffic starts flowing before the punch completes, so the upgrade is invisible except in the logs. If the punch never succeeds the connection keeps working, relayed.</div>
+  </div>
+
+  <div class="callout" data-c="observability-callout">
+    <strong>Log the connection type, and make it queryable.</strong> Direct versus relayed is the single most useful diagnostic this tool has, and the only way a user learns their network is the hard kind. Print it on establishment and on every upgrade. A <code>rtun status</code> subcommand that reports the current path is worth the twenty lines.
+  </div>
+
+  <h2 id="tcp-path">Data plane — TCP</h2>
+
+  <p>One QUIC bidirectional stream per accepted TCP connection, opened by the <strong>connecting</strong> side — the inverse of v1, because that is now where traffic arrives first. The stream carries a two-byte header naming the target port on the serving side, then raw bytes in both directions until either end closes.</p>
+
+  <div class="diagram" data-c="diag-tcp">
+    <pre class="mermaid">
+sequenceDiagram
+  participant U as Local process on the laptop
+  participant C as rtun connect
+  participant S as rtun serve
+  participant L as sshd port 22
+  U->>C: TCP connect to 127.0.0.1:2222
+  Note over C: mapping 2222 to 22 comes from --tcp on this side
+  C->>S: open QUIC bidi stream
+  C->>S: header u16 target_port = 22
+  Note over S: reject unless 22 is in the serve allowlist
+  S->>L: TCP connect 127.0.0.1:22
+  L-->>S: established
+  loop until either end closes
+    U->>C: bytes
+    C->>S: stream write
+    S->>L: bytes
+    L->>S: bytes
+    S->>C: stream write
+    C->>U: bytes
+  end
+  Note over C,S: stream FIN maps to TCP FIN in both directions
+    </pre>
+    <div class="caption">Hình 4 — TCP forwarding. Each connection is an isolated QUIC stream, so one slow transfer cannot stall another.</div>
+  </div>
+
+  <p>Both directions are a plain <code>tokio::io::copy</code> pair — the stream halves and the TCP socket halves are all <code>AsyncRead</code>/<code>AsyncWrite</code>, so no custom pump loop is needed. This is unchanged from v1 and is the one part of the design the pivot did not touch.</p>
+
+  <h2 id="udp-path">Data plane — UDP</h2>
+
+  <p>UDP has no connections, so the connecting side synthesises sessions: the tuple <code>(local source address, target port)</code> is mapped to a <code>u32</code> session id. Every datagram carries the id and the target port as a six-byte prefix, which is how replies find their way back to the right local process.</p>
+
+  <div class="diagram" data-c="diag-udp">
+    <pre class="mermaid">
+sequenceDiagram
+  participant U as Local process on the laptop
+  participant C as rtun connect
+  participant S as rtun serve
+  participant L as wireguard port 51820
+  U->>C: UDP packet to 127.0.0.1:51820
+  Note over C: look up or create session id<br/>keyed by source addr and target port
+  C->>S: QUIC datagram, u32 session_id, u16 port, payload
+  Note over S: look up or create a UDP socket<br/>dedicated to this session id
+  S->>L: sendto 127.0.0.1:51820
+  L->>S: reply
+  S->>C: QUIC datagram, same session_id, payload
+  C->>U: sendto the original source addr
+  Note over C,S: session and socket dropped after 60s idle
+    </pre>
+    <div class="caption">Hình 5 — UDP forwarding. The session id is the only state; both sides reap it on an idle timer.</div>
+  </div>
+
+  <p>The port travels in every datagram rather than being negotiated once, because datagrams are unreliable and unordered — a setup message could be the one that gets lost. Six bytes per datagram buys the absence of that failure mode.</p>
+
+  <h2 id="protocol">Wire protocol</h2>
+
+  <p>Two message shapes, and no handshake at all. The <a href="#identity">identity layer</a> already authenticated both ends before the first byte of application data, and the port mapping lives entirely on the connecting side, so there is nothing left to negotiate.</p>
+
+  <table data-c="proto-table">
+    <thead>
+      <tr><th>Channel</th><th>Opened by</th><th>Payload</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Data stream</td>
+        <td>Connecting side, one per inbound TCP connection</td>
+        <td><code>u16</code> target port, then opaque bytes.</td>
+      </tr>
+      <tr>
+        <td>Datagram</td>
+        <td>Either side</td>
+        <td><code>u32</code> session id, <code>u16</code> target port, then opaque bytes.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>v1 needed a length-prefixed JSON handshake to carry a token and a port list. Both are gone — <code>serde</code> and <code>serde_json</code> leave the dependency list with them.</p>
+
+  <h2 id="identity">Identity and authorization</h2>
+
+  <p>Each endpoint has an ed25519 keypair, and its public key is both its address and its TLS identity. Dialing by endpoint ID is therefore mutually authenticated by construction: a machine-in-the-middle would need the private key it is impersonating.</p>
+
+  <div class="cards" data-c="identity-cards">
+    <div class="card">
+      <h3>The connecting side knows who it reached</h3>
+      <p>It dialed a specific public key. The QUIC handshake cannot complete against anything else. No fingerprint flag, no pinning logic, no way to forget to check.</p>
+    </div>
+    <div class="card">
+      <h3>The serving side decides who may in</h3>
+      <p>An allowlist of endpoint IDs, given as repeatable <code>--allow</code> flags. Any other peer is dropped immediately after the handshake reveals its key.</p>
+    </div>
+  </div>
+
+  <div class="callout" data-c="identity-callout">
+    <strong>Nothing secret travels out of band any more.</strong> v1 required a shared token to reach the client through a trusted channel — a real operational hazard, since a leaked token was full access. v2 exchanges two <em>public</em> keys. Publishing them costs nothing: knowing an endpoint ID lets you attempt a connection, and the allowlist rejects it. The private keys never leave the machines that generated them.
+  </div>
+
+  <p>Port-level authorization lives on the serving side too. <code>rtun serve --tcp 22 --udp 51820</code> is an allowlist, not a mapping — it states which local ports may be reached at all. A stream naming any other port is refused. Without this, one allowlisted peer could reach every port on the loopback interface, which is a larger grant than the flags suggest.</p>
+
+  <h2 id="cli">CLI surface</h2>
+
+  <pre><code># on the machine with the services — offers ports, accepts connections
+rtun serve --tcp 22 --udp 51820 --allow k51qzi5uqu5dl…
+# prints: endpoint id k51qzi5uqu5dh9…
+
+# on the machine that wants to reach them — binds local listeners
+rtun connect k51qzi5uqu5dh9… --tcp 2222:22 --udp 51820:51820
+# prints: connected, path=direct
+# then:   ssh -p 2222 127.0.0.1
+
+# either side, to print its own endpoint id without connecting
+rtun id</code></pre>
+
+  <p>Mappings are <code>local:remote</code> on the connecting side and bare port numbers on the serving side. The asymmetry is deliberate: only the connecting side needs to choose local port numbers, and only the serving side needs to decide what is exposed.</p>
+
+  <p>The endpoint IDs are chicken-and-egg — each side needs the other's before either can start. <code>rtun id</code> exists so both can be read off before any connection is attempted.</p>
+
+  <h2 id="layout">Code layout</h2>
+
+  <table data-c="layout-table">
+    <thead><tr><th>File</th><th>Holds</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/main.rs</code></td><td>clap definitions, key persistence, dispatch to serve, connect or id</td></tr>
+      <tr><td><code>src/proto.rs</code></td><td>stream and datagram framing, endpoint id parsing</td></tr>
+      <tr><td><code>src/serve.rs</code></td><td>iroh endpoint, allowlist check, stream accept loop, UDP socket table</td></tr>
+      <tr><td><code>src/connect.rs</code></td><td>dial and reconnect, local listeners, UDP session table</td></tr>
+      <tr><td><code>tests/tunnel.rs</code></td><td>the integration check described below</td></tr>
+    </tbody>
+  </table>
+
+  <p>The two role files are near-mirrors of each other, but not identical enough to unify — the session tables are keyed differently and only one side holds an allowlist. Two honest files beat one file with a role flag threaded through it.</p>
+
+  <h2 id="milestones">Build order</h2>
+
+  <table data-c="milestones-table">
+    <thead><tr><th></th><th>Milestone</th><th>Done when</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">M1</span></td>
+        <td>Two endpoints meet</td>
+        <td>Both sides print a stable endpoint id across restarts; <code>connect</code> reaches <code>serve</code> by id; a non-allowlisted peer is refused. No forwarding yet.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">M2</span></td>
+        <td>Confirmed direct</td>
+        <td>The log reports <code>path=direct</code> between two machines on different NATs, not merely on the same LAN. <strong>Do this before writing any forwarding code</strong> — it is the milestone that validates the whole premise.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">M3</span></td>
+        <td>TCP forwarding</td>
+        <td><code>ssh -p 2222 127.0.0.1</code> reaches the far machine. Multiple simultaneous connections stay independent. Non-allowlisted ports refused.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">M4</span></td>
+        <td>UDP forwarding</td>
+        <td>A DNS query and a WireGuard handshake both complete through the tunnel. Idle sessions are reaped.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">M5</span></td>
+        <td>Survives reality</td>
+        <td>Reconnects with exponential backoff after the link drops; survives a laptop sleep, a Wi-Fi to cellular switch, and a NAT rebind without manual intervention.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">M6</span></td>
+        <td>Shipped</td>
+        <td>Binaries for Linux, macOS and Windows; installed and running unattended under each platform's service manager; surviving a reboot on all three.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn" data-c="m2-callout">
+    <strong>M2 is the risk milestone and it comes early on purpose.</strong> Everything after it is ordinary byte plumbing that v1 already specified. If your two networks turn out to be symmetric-NAT on both sides, you learn it in an afternoon rather than after building the entire data plane on an assumption. Test across two genuinely different networks — a laptop tethered to a phone is the cheapest second network there is.
+  </div>
+
+  <h2 id="testing">The one check</h2>
+
+  <p><code>tests/tunnel.rs</code> starts both roles in-process on loopback with ephemeral keys, then asserts round-trips against throwaway echo services:</p>
+
+  <ul>
+    <li>a TCP echo, verifying byte-exact round-trip over the tunnel;</li>
+    <li>two concurrent TCP connections, verifying their payloads do not cross;</li>
+    <li>a UDP echo, verifying datagram round-trip and that the reply reaches the correct local source;</li>
+    <li>a connection from a non-allowlisted key, verifying it is refused;</li>
+    <li>a stream naming a non-allowlisted port, verifying it is refused.</li>
+  </ul>
+
+  <p>That is enough to fail loudly if the framing, session mapping, stream routing or either allowlist breaks. No fixtures, no mocking framework.</p>
+
+  <p>The two authorization cases earn their place despite the ladder — a silent regression there is not a bug that shows up as a broken feature, it is one that shows up as an open door. Note what this check deliberately does <em>not</em> cover: hole punching. On loopback there is nothing to punch. NAT traversal is verified by <a href="#milestones">M2</a> on real networks, by hand, and cannot be meaningfully unit-tested.</p>
+
+  <h2 id="packaging">Packaging</h2>
+
+  <p><strong>The deliverable is one statically linked executable per platform, a few megabytes, with no runtime, no shared libraries and no config file.</strong> All roles are the same binary — the subcommand chooses — so there is exactly one artifact per platform.</p>
+
+  <p>v1 could treat non-Linux targets as an afterthought because only the relay was a real deployment. v2 has no relay, so <em>every</em> target is a first-class client and all three ship together.</p>
+
+  <h3 id="packaging-targets">Target triples</h3>
+
+  <table data-c="targets-table">
+    <thead><tr><th>Target</th><th>For</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>x86_64-unknown-linux-musl</code></td><td>Linux boxes, home servers, a self-hosted relay</td><td>Fully static, so one file runs on Debian, Ubuntu, Alpine and an ancient CentOS alike.</td></tr>
+      <tr><td><code>aarch64-unknown-linux-musl</code></td><td>ARM boards, Raspberry Pi, ARM instances</td><td>Same build, different triple.</td></tr>
+      <tr><td><code>aarch64-apple-darwin</code></td><td>Apple Silicon Macs</td><td>Native <code>cargo build --release</code> on the dev machine.</td></tr>
+      <tr><td><code>x86_64-apple-darwin</code></td><td>Intel Macs</td><td>Cheap to add while the matrix is being written; drop it if nobody has one.</td></tr>
+      <tr><td><code>x86_64-pc-windows-msvc</code></td><td>Windows clients</td><td>No longer deferred. Requires a Windows CI runner — see below.</td></tr>
+    </tbody>
+  </table>
+
+  <p><strong>musl rather than gnu</strong> on Linux is still the right call: a glibc-linked binary inherits the build machine's glibc version and greets you with <code>GLIBC_2.34 not found</code> on an older box, while a musl binary has no such link to break. The cost is musl's slower allocator under heavy multi-threaded churn, which a byte pump never approaches.</p>
+
+  <div class="callout warn" data-c="crosscompile-callout">
+    <strong>Cross-compiling from a Mac no longer covers the matrix.</strong> <code>cross</code> handles the Linux targets, but <code>x86_64-pc-windows-msvc</code> needs the MSVC toolchain and Apple targets need Apple's SDK — neither is legitimately cross-buildable from the other's host. Three platforms means CI with three runners, not a clever local script. This is the concrete reason v2 skips <a href="#packaging-delivery">rungs 0 and 1</a> of the old delivery ladder.
+  </div>
+
+  <h3 id="packaging-delivery">Delivery</h3>
+
+  <p>v1's ladder started at <code>scp</code> and expected to stay there. That was correct for one relay and one client; it is wrong for three operating systems, because the bottom two rungs cannot even produce the artifacts.</p>
+
+  <p><strong>The plan of record is <code>cargo dist init</code>.</strong> One command generates the GitHub Actions matrix across all three runners, checksums, a <code>curl … | sh</code> installer for macOS and Linux, a PowerShell <code>irm … | iex</code> installer for Windows, an MSI, and a Homebrew tap. Hand-writing three installers to arrive at the same place is strictly more work than running one command.</p>
+
+  <table data-c="delivery-table">
+    <thead><tr><th></th><th>Mechanism</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">✓</span></td>
+        <td><code>cargo dist init</code>, release on tag push</td>
+        <td><strong>The plan of record.</strong> Adopt at M6.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">·</span></td>
+        <td><code>cargo build --release</code> and copy the binary by hand</td>
+        <td>Fine for M1 through M5, while both ends are machines you are actively developing on.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">✕</span></td>
+        <td>Hand-written MSI / WiX, pkg, apt repo, Docker image</td>
+        <td>Not planned. <code>cargo dist</code> produces the ones that matter.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">✕</span></td>
+        <td>Code signing and notarization</td>
+        <td>Deferred. Gatekeeper and SmartScreen will warn on first run; document the right-click-Open dance. Lift when someone who is not you installs it.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn" data-c="secrets-callout">
+    <strong>Never bundle keys into the installer.</strong> It is tempting, now that setup needs an endpoint ID on each side, to bake them into a per-user build. Don't — the artifact is public, and a build that embeds an allowlist is a build that must be regenerated for every peer. The keys are generated on first run, on the machine that will hold them, and the IDs are exchanged afterwards.
+  </div>
+
+  <h3 id="packaging-bootstrap">Pairing two machines</h3>
+
+  <div class="diagram" data-c="diag-bootstrap">
+    <pre class="mermaid">
+sequenceDiagram
+  participant A as Machine A
+  participant H as You, by hand
+  participant B as Machine B
+  Note over A: first run generates and persists a keypair
+  Note over B: first run generates and persists a keypair
+  A-->>H: rtun id prints k51q…A
+  B-->>H: rtun id prints k51q…B
+  H->>B: rtun serve --allow k51q…A
+  H->>A: rtun connect k51q…B --tcp 2222:22
+  Note over A,B: both keys are public; the channel need not be private
+    </pre>
+    <div class="caption">Hình 6 — Pairing is manual on purpose. Automating it means an enrolment server, which is <a href="#out-of-scope">out of scope</a>. Unlike v1, nothing here is confidential — only correct.</div>
+  </div>
+
+  <h2 id="deployment">Running it unattended</h2>
+
+  <p>There is no VPS unit any more. Instead each machine runs its role under its own platform's service manager. This is the one place the pivot <em>added</em> work: v1 needed one systemd unit, v2 needs three mechanisms.</p>
+
+  <table data-c="service-table">
+    <thead><tr><th>Platform</th><th>Mechanism</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Linux</td><td><code>systemd</code> unit</td><td>Unchanged in shape from v1, minus the capability line. <code>StateDirectory=rtun</code> holds the persisted key.</td></tr>
+      <tr><td>macOS</td><td><code>launchd</code> plist in <code>~/Library/LaunchAgents</code></td><td>A user agent, not a daemon — no root, and it stops when the user logs out, which is usually what you want on a laptop.</td></tr>
+      <tr><td>Windows</td><td>Task Scheduler, trigger At log on</td><td>A bare exe cannot be a Windows service without a wrapper. Task Scheduler needs no wrapper and no admin rights. Reach for <code>sc.exe</code> plus a shim only if it must run before login.</td></tr>
+    </tbody>
+  </table>
+
+  <pre><code># /etc/systemd/system/rtun.service — Linux
+[Unit]
+Description=rtun
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/rtun serve --tcp 22 --allow k51qzi5uqu5dl…
+DynamicUser=yes
+StateDirectory=rtun                # /var/lib/rtun holds the persisted key
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target</code></pre>
+
+  <div class="callout" data-c="noprivilege-callout">
+    <strong>No privileged ports anywhere, on any platform.</strong> v1 needed <code>CAP_NET_BIND_SERVICE</code> because the relay bound public low ports. v2's serving side only makes outbound loopback connections, and the connecting side binds whatever local port you pick — choose one above 1024 and the whole question disappears. There is no <code>AmbientCapabilities</code> line and no reason to run as root.
+  </div>
+
+  <div class="callout" data-c="firewall-callout">
+    <strong>There is usually no firewall work at all.</strong> Both sides only ever send outbound UDP, which every consumer firewall already permits. If a corporate firewall blocks outbound UDP entirely, hole punching and the QUIC relay both fail together and the tunnel does not come up — see <a href="#ceilings">known ceilings</a>.
+  </div>
+
+  <h2 id="ceilings">Known ceilings</h2>
+
+  <p>Deliberate simplifications, each with the condition that would justify lifting it. These are the items that will carry <code>ponytail:</code> comments in the source.</p>
+
+  <table data-c="ceilings-table">
+    <thead><tr><th>Ceiling</th><th>Consequence</th><th>Lift it when</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>Both ends must run <code>rtun</code></strong></td>
+        <td>No public ingress. You cannot hand a colleague an address, point a webhook at it, or open it in a browser. This is the price of the whole design.</td>
+        <td>Never, within this scope. If you need public ingress, you need <a href="#pivot">v1's relay</a> — and you would run it <em>alongside</em> this, not instead of it.</td>
+      </tr>
+      <tr>
+        <td>Roughly one connection in ten cannot be hole-punched</td>
+        <td>Symmetric NAT on both sides falls back to a relay, with that relay's latency and bandwidth.</td>
+        <td>Never — it is a property of the networks, not the code. Report it honestly in <code>rtun status</code> so it is visible rather than mysterious.</td>
+      </tr>
+      <tr>
+        <td>Default discovery and relay are third-party infrastructure</td>
+        <td>Connection setup depends on a service you do not run. Metadata — which keys talked, and when — is visible to it; payload is not, being end-to-end encrypted.</td>
+        <td>You object to the dependency or the metadata. Then self-host <code>iroh-relay</code>; the $4 VPS from v1 does the job and now costs almost no bandwidth.</td>
+      </tr>
+      <tr>
+        <td>Outbound UDP is required</td>
+        <td>A network permitting only TCP :443 blocks the tunnel entirely — direct and relayed alike.</td>
+        <td>You actually hit such a network.</td>
+      </tr>
+      <tr>
+        <td>UDP payload capped at the QUIC datagram size, roughly 1200 bytes minus the 6-byte header</td>
+        <td>Larger UDP datagrams are dropped, not fragmented. Harmless for DNS, WireGuard, game and voice traffic; breaks applications sending jumbo datagrams.</td>
+        <td>A real workload needs it — then fragment across a dedicated stream per session.</td>
+      </tr>
+      <tr>
+        <td>One peer connection at a time</td>
+        <td>No fan-out to several machines from one <code>serve</code> instance.</td>
+        <td>A third machine needs in. This is a genuinely small change under iroh — the endpoint already accepts many connections — but the session tables need a peer dimension.</td>
+      </tr>
+      <tr>
+        <td>Flags instead of a config file</td>
+        <td>Long command lines once there are many mappings and several allowed keys.</td>
+        <td>The flag list outgrows a comfortable command line. Arrives sooner than in v1, since keys are long.</td>
+      </tr>
+      <tr>
+        <td>Key rotation is manual and mutual</td>
+        <td>Losing a machine's state directory changes its identity; every peer's allowlist must be edited by hand.</td>
+        <td>There is a fleet rather than a pair.</td>
+      </tr>
+      <tr>
+        <td>Binaries unsigned</td>
+        <td>Gatekeeper and SmartScreen warn on first run.</td>
+        <td>Someone who is not you installs it.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="deps">Dependencies</h2>
+
+  <table data-c="deps-table">
+    <thead><tr><th>Crate</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>iroh</code></td><td>QUIC, hole punching, discovery, relay fallback and peer identity in one dependency</td></tr>
+      <tr><td><code>tokio</code></td><td>Async runtime and socket types</td></tr>
+      <tr><td><code>clap</code></td><td>CLI parsing, derive feature</td></tr>
+      <tr><td><code>tracing</code> / <code>tracing-subscriber</code></td><td>Connection-type logging, which <a href="#establishment">is the diagnostic</a></td></tr>
+    </tbody>
+  </table>
+
+  <p>Dropped from v1: <code>quinn</code> (now transitive through iroh), <code>rcgen</code> (no certificates to generate), <code>serde</code> and <code>serde_json</code> (no handshake to serialize). The dependency list got shorter while the capability got larger, which is the tell that the crate choice is right.</p>
+
+  <div class="callout" data-c="prereq-callout">
+    <strong>Prerequisite:</strong> the development machine has no Rust toolchain yet. Install with <code>brew install rustup</code> then <code>rustup-init</code> before starting M1. Confirm the current <code>iroh</code> release and its API at <a href="https://docs.rs/iroh">docs.rs/iroh</a> before writing against the sketch in <a href="#transport-api">Transport</a> — it reached 1.0 recently and the examples above are illustrative, not copied from a compiling build.
+  </div>
+
+  <h2 id="out-of-scope">Explicitly out of scope</h2>
+
+  <p>Named here so they do not get built by accident: public ingress for unmodified clients, HTTP-aware routing and subdomains, a web dashboard, metrics exporters, an enrolment or key-distribution server, more than two peers, mesh routing between peers, and any form of virtual network interface. Each is a larger project than the tunnel itself.</p>
+
+  <p>Worth separating from that list: <strong>a self-hosted relay is not out of scope</strong>, it is simply not needed on day one. It is a configuration change — point the endpoint at your own <code>iroh-relay</code> — rather than code to write.</p>
+
+  </main>
+
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    document.querySelectorAll('.diagram').forEach((d) => {
+      const pre = d.querySelector('pre.mermaid');
+      if (pre) d.dataset.mermaidSrc = pre.textContent;
+    });
+    mermaid.initialize({ startOnLoad: true, theme: 'dark', themeVariables: { darkMode: true, background: '#181b22' } });
+  </script>
+  <script type="module" src="https://htmldoc.wfomobile.com/htmldoc.js"></script>
+</body>
+</html>
