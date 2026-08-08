@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en" data-htmldoc-id="6a771bf69f34851f0dfab217">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RustTunnel — End-to-End Test Plan</title>
+</head>
+<body>
+  <header class="doc-hero">
+    <div class="inner">
+      <h1>RustTunnel — End-to-End Test Plan</h1>
+      <p>How to exercise every phase of the tunnel on one MacBook — the rig, the per-task procedure, the substitutions each one makes, and the four checks that a single machine can never honestly produce.</p>
+      <div class="meta">Draft v1 · 2026-08-08 · RustTunnel</div>
+    </div>
+  </header>
+
+  <main>
+
+  <h2 id="verdict">Verdict</h2>
+
+  <p>
+    <strong>Yes — 20 of the 23 WBS tasks can run on this Mac</strong>, most at full fidelity. What one
+    machine cannot produce is any claim about <em>two</em> machines: cross-machine dialing, hole
+    punching between real NATs, and installing on Linux or Windows. Everything the user actually
+    asked for — connection, round trip, flow — is fully reachable here.
+  </p>
+
+  <div class="cards">
+    <div class="card">
+      <h3>Full fidelity locally</h3>
+      <p>Both allowlists, both data planes, framing, concurrency, bulk transfer, session reaping,
+      the datagram cap, reconnect with backoff, and the 24-hour soak. 12 tasks. These lose nothing
+      by running on one host.</p>
+    </div>
+    <div class="card">
+      <h3>Degraded but worth running</h3>
+      <p>Path reporting, dial-by-ID, SSH end to end, WireGuard, network-change recovery, clean
+      install, service restart, pairing. 8 tasks. Each proves the mechanism but not the topology;
+      the exact loss is named per task.</p>
+    </div>
+    <div class="card">
+      <h3>Cannot run here at all</h3>
+      <p><span class="badge id">0.2</span> three-platform CI, <span class="badge id">2.2</span>
+      cross-NAT direct, <span class="badge id">6.1</span> release artifacts. Three tasks — two want a
+      git remote, one wants a second network.</p>
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>A local run never retires <a href="wbs.html">2.2</a>.</strong> The single most important
+    thing this document does is keep that distinction intact. On one Mac the path upgrades to
+    <code>direct</code> because iroh discovers the host's own LAN address — there is no NAT between
+    the two processes, so nothing was punched. Every check below can pass while the premise of v2
+    remains unproven. File local evidence under <code>evidence/local/</code>, never under
+    <code>evidence/&lt;task-id&gt;/</code>.
+  </div>
+
+  <h2 id="rig">The rig — two roles, one Mac</h2>
+
+  <p>
+    No new code is needed. <code>RTUN_STATE_DIR</code> already exists precisely so two roles can
+    share a machine with separate identities, and the release binary is built. The whole harness is
+    fifteen lines of prelude that every procedure below assumes has been sourced.
+  </p>
+
+  <div class="diagram" data-c="rig-diagram">
+    <pre class="mermaid">
+flowchart LR
+  subgraph B["Role B — rtun connect · RTUN_STATE_DIR=/tmp/rtun-b"]
+    CL["curl / ssh / dig
+the test client"]
+    LP["local listener
+127.0.0.1:2222"]
+  end
+  subgraph N["one macOS kernel"]
+    QD["direct path
+ip:192.168.1.8:*"]
+    QR["relayed path
+aps1-1.relay.n0.iroh.link"]
+  end
+  subgraph A["Role A — rtun serve · RTUN_STATE_DIR=/tmp/rtun-a"]
+    SV["allowlist: --tcp 8022"]
+    SS["python3 -m http.server
+127.0.0.1:8022"]
+  end
+  CL --> LP
+  LP ==>|"default"| QD ==> SV
+  LP -.->|"--relay-only"| QR -.-> SV
+  SV --> SS
+    </pre>
+    <div class="caption">Hình 1 — Both roles on one host. The dotted path is the same rig with
+    <code>--relay-only</code> on both sides, which is the only way to get real RTT and real packet
+    loss into a local run.</div>
+  </div>
+
+  <h3 id="prelude">Prelude</h3>
+
+  <pre><code>cd ~/Documents/proj/misc/RustTunnel
+export PATH=$HOME/.cargo/bin:$PATH        # cargo is not on the default non-login PATH
+cargo build --release
+R=$PWD/target/release/rtun
+
+A=/tmp/rtun-a B=/tmp/rtun-b C=/tmp/rtun-c   # three "machines": serve, connect, stranger
+mkdir -p $A $B $C
+IDA=$(RTUN_STATE_DIR=$A $R id)
+IDB=$(RTUN_STATE_DIR=$B $R id)
+IDC=$(RTUN_STATE_DIR=$C $R id)
+[ "$IDA" != "$IDB" ] || { echo "same identity — RTUN_STATE_DIR is not taking effect"; exit 1; }
+
+# the "remote service", unprivileged, carrying a token only it can serve
+mkdir -p /tmp/rtun-www && uuidgen > /tmp/rtun-www/token
+(cd /tmp/rtun-www &amp;&amp; python3 -m http.server 8022 --bind 127.0.0.1) &amp;</code></pre>
+
+  <p>
+    Role A is the home box, role B is the laptop, role C exists only to be refused. Every run
+    captures both sides:
+  </p>
+
+  <pre><code>RTUN_STATE_DIR=$A $R serve   --tcp 8022 --allow $IDB          &gt; serve.log   2&gt;&amp;1 &amp;
+RTUN_STATE_DIR=$B $R connect $IDA --tcp 2222:8022             &gt; connect.log 2&gt;&amp;1 &amp;</code></pre>
+
+  <div class="callout">
+    <strong>Why <code>python3 -m http.server</code> and not <code>sshd</code> as the default
+    service.</strong> It needs no admin rights, it is threaded since Python 3.7 so it can serve the
+    concurrency check, and the token file gives the test a value that <em>only</em> the far service
+    can produce. <code>sshd</code> stays in the plan for <span class="badge id">3.1</span>, but it
+    requires enabling Remote Login and its usual proof — <code>hostname</code> differing — is
+    exactly the proof one machine cannot give.
+  </div>
+
+  <h3 id="rig-verified">The rig, verified today</h3>
+
+  <p>
+    Captured from the prelude above before this document was written, so the procedures are not
+    hypothetical:
+  </p>
+
+  <pre><code>serve.log
+  INFO rtun::serve: serving id=5e37e5de… allowed=1
+  INFO rtun::serve: admitted peer=c65f7772…
+  INFO rtun: established peer=c65f7772be path=relayed addr=relay:https://aps1-1.relay.n0.iroh.link./ rtt=254.4ms
+  INFO rtun: path selected peer=c65f7772be path=direct addr=ip:192.168.1.8:60094
+
+connect.log
+  INFO rtun::connect: dialing id=c65f7772… peer=5e37e5de…
+  INFO rtun: established peer=5e37e5de33 path=relayed addr=relay:https://aps1-1.relay.n0.iroh.link./ rtt=354.0ms
+  INFO rtun: path selected peer=5e37e5de33 path=direct addr=ip:192.168.1.8:54580</code></pre>
+
+  <div class="callout warn">
+    <strong>The WBS text for 2.1 is wrong about timing, and the check should be fixed rather than
+    the code.</strong> It says a same-machine run "reports direct immediately, with no relay in
+    between". It does not — establishment is <code>relayed</code> through the public n0 relay and the
+    direct path is selected about 250 ms later, exactly as
+    <a href="implementation-plan.html">Hình 3</a> of the plan describes. Assert <em>reaches</em>
+    <code>path=direct</code> within a few seconds; asserting immediacy makes a correct
+    implementation look broken.
+  </div>
+
+  <h2 id="executed">P0–P2, executed</h2>
+
+  <p>
+    Every P0–P2 check in this document was run on 2026-08-08 against <code>rtun 0.1.0</code> before
+    the document was published. Transcripts and both-sided logs are filed under
+    <code>evidence/local/</code>.
+  </p>
+
+  <table>
+    <thead><tr><th>Check</th><th>Result</th><th>What the logs show</th></tr></thead>
+    <tbody>
+      <tr><td><code>cargo test</code></td><td><span class="badge auto">pass</span></td><td>2 passed — <code>port_map_parses_and_rejects_junk</code>, <code>allowlist_admits_only_listed_peers</code>.</td></tr>
+      <tr><td><span class="badge id">0.1</span> build and CLI surface</td><td><span class="badge auto">pass</span></td><td>Release build clean; all four help texts print.</td></tr>
+      <tr><td><span class="badge id">1.1</span> persistent identity</td><td><span class="badge auto">pass</span></td><td>Id identical across restarts, different after <code>rm -rf</code>, bits <code>-rw-------</code> / <code>drwx------</code>. A truncated key file is refused with exit 1 rather than silently regenerated.</td></tr>
+      <tr><td><span class="badge id">1.2</span> dial by id <span class="badge approval">degraded</span></td><td><span class="badge auto">pass</span></td><td>Both sides name the other's id. Cross-machine still open.</td></tr>
+      <tr><td><span class="badge id">1.3</span> peer allowlist</td><td><span class="badge auto">pass</span></td><td>Serve logs <code>refused: endpoint id not in --allow</code> naming the full stranger key; connect logs <code>closed by peer: not in --allow (code 1)</code>. Re-run with the key added: <code>admitted</code>, link held.</td></tr>
+      <tr><td><span class="badge id">2.1</span> path reporting <span class="badge approval">degraded</span></td><td><span class="badge auto">pass</span></td><td><code>relayed</code> at establishment, <code>direct</code> 120–320 ms later, at the host's LAN address. Reporting works; nothing was punched.</td></tr>
+      <tr><td><span class="badge id">2.3</span> relay fallback holds</td><td><span class="badge auto">pass</span></td><td>6m43s window, 6 <code>still up path=relayed</code> heartbeats per side, zero <code>closed:</code> lines, zero <code>path=direct</code> leak, both processes alive at the end. Relay RTT 116–314 ms.</td></tr>
+      <tr><td><span class="badge id">0.2</span> <span class="badge id">2.2</span></td><td><span class="badge id">not run</span></td><td>Off-box by design. Unchanged in <code>evidence/README.md</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <strong>One product finding: <code>connect</code> exits 0 when the allowlist refuses it.</strong>
+    The refusal is logged on both sides and the close code is correct, but the process returns success,
+    so a script can only tell refusal from a clean shutdown by grepping the log. This matters more
+    than it looks once <span class="badge id">5.1</span> lands reconnect: a refused peer must not be
+    retried forever, an absent peer must be. Distinguish <code>ApplicationClosed</code> from the other
+    close reasons and exit non-zero on it.
+  </div>
+
+  <h2 id="coverage">Coverage matrix</h2>
+
+  <p>
+    Every WBS task, what running it on this Mac gives you, and what it costs. <span class="badge auto">local</span>
+    means the check loses nothing. <span class="badge approval">degraded</span> means it runs and is
+    worth running, but the target's claim is only partly reached. <span class="badge id">off-box</span>
+    means do not attempt it here.
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Task</th><th>Locally</th><th>How, and what it costs</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><span class="badge id">0.1</span> Skeleton and toolchain</td><td><span class="badge auto">local</span></td><td>Already done. <code>cargo build --release</code> plus four <code>--help</code> outputs.</td></tr>
+      <tr><td><span class="badge id">0.2</span> Three-platform CI</td><td><span class="badge id">off-box</span></td><td>Needs a git remote and three runners. Docker can compile the Linux target locally, which is not the same claim.</td></tr>
+      <tr><td><span class="badge id">1.1</span> Persistent identity</td><td><span class="badge auto">local</span></td><td>Already done. Restart-stability and <code>0600</code> bits are properties of one filesystem.</td></tr>
+      <tr><td><span class="badge id">1.2</span> Dial by endpoint ID</td><td><span class="badge approval">degraded</span></td><td>Works with two state dirs. Loses "from a different machine" — the target's whole point.</td></tr>
+      <tr><td><span class="badge id">1.3</span> Peer allowlist</td><td><span class="badge auto">local</span></td><td>Already done. Refusal is a key comparison; topology is irrelevant to it.</td></tr>
+      <tr><td><span class="badge id">2.1</span> Path reporting</td><td><span class="badge approval">degraded</span></td><td>Already done. Reports <code>direct</code>, but via LAN discovery — the reporting works, the punching is untested.</td></tr>
+      <tr><td><span class="badge id">2.2</span> Cross-NAT direct <strong>gate</strong></td><td><span class="badge id">off-box</span></td><td>Loopback has nothing to traverse. Out of scope for this document; the risk stays open.</td></tr>
+      <tr><td><span class="badge id">2.3</span> Relay fallback</td><td><span class="badge auto">local</span></td><td>Already done. <code>--relay-only</code> on both sides is a genuine WAN round trip through n0.</td></tr>
+      <tr><td><span class="badge id">3.1</span> One connection end to end</td><td><span class="badge approval">degraded</span></td><td>Token fetch proves the byte path; SSH runs but <code>hostname</code> cannot distinguish the hosts.</td></tr>
+      <tr><td><span class="badge id">3.2</span> Port allowlist</td><td><span class="badge auto">local</span></td><td>Refusal of an unoffered port is pure protocol. Nothing lost.</td></tr>
+      <tr><td><span class="badge id">3.3</span> Concurrency and clean close</td><td><span class="badge auto">local</span></td><td>Two concurrent transfers plus a 100 MB checksum. Add the relayed repeat to get real loss.</td></tr>
+      <tr><td><span class="badge id">3.4</span> Re-verify relayed</td><td><span class="badge auto">local</span></td><td>The most valuable local run there is — the only one with real RTT. Cap the transfer at 10 MB.</td></tr>
+      <tr><td><span class="badge id">4.1</span> DNS round trip</td><td><span class="badge auto">local</span></td><td><code>dnsmasq</code> on <code>127.0.0.1:5353</code>, <code>dig</code> through the mapped port. Real resolver, real ANSWER.</td></tr>
+      <tr><td><span class="badge id">4.2</span> WireGuard handshake</td><td><span class="badge approval">degraded</span></td><td>Two <code>utun</code>s on one host fight over routes. Substitute a sustained UDP flow; keep 4.2 open.</td></tr>
+      <tr><td><span class="badge id">4.3</span> Session reaping</td><td><span class="badge auto">local</span></td><td>Distinct source ports, wait past the idle timer, count back to zero. Needs one log line — see <a href="#observability">observability</a>.</td></tr>
+      <tr><td><span class="badge id">4.4</span> Oversize datagram</td><td><span class="badge auto">local</span></td><td>Better locally than remotely: loopback MTU is 16 KB, so any drop must come from rtun's own cap.</td></tr>
+      <tr><td><span class="badge id">5.1</span> Reconnect with backoff</td><td><span class="badge auto">local</span></td><td>Kill and restart <code>serve</code>. Backoff is a timer in one process.</td></tr>
+      <tr><td><span class="badge id">5.2</span> Survives a network change</td><td><span class="badge approval">degraded</span></td><td>Wi-Fi flap and sleep are real, but symmetric — both ends transition together. See <a href="#pf">the pf trick</a>.</td></tr>
+      <tr><td><span class="badge id">5.3</span> 24-hour soak</td><td><span class="badge auto">local</span></td><td>Full fidelity, and one Mac is the honest environment for it. Needs <code>caffeinate</code>.</td></tr>
+      <tr><td><span class="badge id">6.1</span> Release artifacts</td><td><span class="badge id">off-box</span></td><td>Tag push and a release page. <code>cargo dist build</code> produces host artifacts only.</td></tr>
+      <tr><td><span class="badge id">6.2</span> Clean-machine install</td><td><span class="badge approval">degraded</span></td><td>A fresh macOS user account is a fair proxy for macOS. Linux and Windows are not available here.</td></tr>
+      <tr><td><span class="badge id">6.3</span> Service survives reboot</td><td><span class="badge approval">degraded</span></td><td><code>launchd</code> agent plus a real reboot works. Loses the far-side observer, which reboots too.</td></tr>
+      <tr><td><span class="badge id">6.4</span> Pairing walkthrough</td><td><span class="badge approval">degraded</span></td><td>A fresh user account catches path and permission bugs; it cannot catch "obvious to the author".</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="order">Run order</h2>
+
+  <div class="diagram" data-c="order-diagram">
+    <pre class="mermaid">
+flowchart TD
+  UT["cargo test
+in-process regression net"] --> RIG["prelude
+IDA != IDB, service up"]
+  RIG --> P1["P1 · identity
+1.1 1.2 1.3"]
+  P1 --> P2["P2 · path
+2.1 2.3 direct and relayed"]
+  P2 --> P3["P3 · TCP
+3.1 3.2 3.3"]
+  P3 --> P34["3.4 repeat relayed
+the run with real RTT"]
+  P34 --> P4["P4 · UDP
+4.1 4.3 4.4"]
+  P4 --> P5["P5 · resilience
+5.1 5.2 then 5.3 soak"]
+  P5 --> P6["P6 · macOS ship
+6.2 6.3 6.4 on a fresh user"]
+  P34 -.->|"never satisfies"| GATE["2.2 cross-NAT
+still open"]
+    </pre>
+    <div class="caption">Hình 2 — Local order. <code>cargo test</code> gates everything because a
+    failing regression net makes every downstream result ambiguous. The relayed repeat sits directly
+    after the direct TCP checks, while the framing is fresh in mind.</div>
+  </div>
+
+  <h2 id="p0">P0 — Foundation</h2>
+
+  <table>
+    <thead><tr><th>Task</th><th>Procedure</th><th>Pass</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">0.1</span></td>
+        <td><code>cargo build --release</code>, then <code>$R --help</code> and <code>$R serve|connect|id --help</code>.</td>
+        <td>Build succeeds, all four help texts print. Already filed as <code>evidence/0.1</code>.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">0.2</span></td>
+        <td>Off-box. The nearest local thing is <code>docker run --rm -v $PWD:/w -w /w rust:1 cargo test</code>, which proves the Linux <em>compile</em> and nothing about Windows.</td>
+        <td>Stays blocked until a remote exists. Do not file a Docker run as 0.2 evidence.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="p1">P1 — Identity</h2>
+
+  <table>
+    <thead><tr><th>Task</th><th>Procedure</th><th>Pass</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">1.1</span></td>
+        <td><code>RTUN_STATE_DIR=$A $R id</code> twice; <code>rm -rf $A</code> and again; <code>ls -ld $A $A/secret.key</code>.</td>
+        <td>First two identical, third different, bits <code>-rw-------</code> and <code>drwx------</code>.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">1.2</span></td>
+        <td>Start serve and connect from the <a href="#prelude">prelude</a>. Each side's log names the other's ID.</td>
+        <td>The IDs in both logs match what <code>rtun id</code> printed for the other state dir. <strong>Cross-machine remains open</strong> — see <a href="#substitutions">substitutions</a>.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">1.3</span></td>
+        <td><code>RTUN_STATE_DIR=$C $R connect $IDA</code> against a serve that allows only <code>$IDB</code>; then add <code>--allow $IDC</code> and retry.</td>
+        <td>First attempt: serve logs <code>refused</code> naming <code>$IDC</code>, connect exits with the application close code. Second: <code>admitted</code>.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="p2">P2 — Path</h2>
+
+  <table>
+    <thead><tr><th>Task</th><th>Procedure</th><th>Pass</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">2.1</span></td>
+        <td>Default prelude run, held 15 s. Grep both logs for <code>established</code> and <code>path selected</code>.</td>
+        <td>Both sides log <code>path=relayed</code> on establishment and <code>path=direct</code> within a few seconds, at the host's LAN address.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">2.3</span></td>
+        <td>Add <code>--relay-only</code> to both roles. Hold six minutes so at least five <code>PATH_HEARTBEAT</code> ticks land.</td>
+        <td><code>still up path=relayed</code> at both ends of the window, on both sides, and neither process logged <code>closed:</code>.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">2.2</span></td>
+        <td>Out of scope here by decision. The procedure is unchanged in <code>evidence/README.md</code>: home ISP on one box, cellular tethering on the other.</td>
+        <td>—</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="p3">P3 — TCP forwarding</h2>
+
+  <p>The data plane does not exist yet; these are the checks to write alongside it.</p>
+
+  <div class="diagram" data-c="p3-proof">
+    <pre class="mermaid">
+sequenceDiagram
+  participant T as test script
+  participant B as rtun connect
+  participant A as rtun serve
+  participant H as http.server :8022
+  T->>B: curl 127.0.0.1:2222/token
+  B->>A: bidi stream, u16 port = 8022
+  Note over A: 8022 is in --tcp, so allowed
+  A->>H: TCP 127.0.0.1:8022
+  H-->>T: the uuid only this service holds
+  Note over T: kill rtun connect
+  T->>B: curl 127.0.0.1:2222/token again
+  B--xT: connection refused
+    </pre>
+    <div class="caption">Hình 3 — Proving the byte path on one host. The token establishes
+    <em>which</em> service answered; killing <code>connect</code> and losing the port establishes
+    that rtun, not the kernel, was carrying it.</div>
+  </div>
+
+  <h3 id="t31">3.1 · One connection end to end <span class="badge approval">degraded</span></h3>
+
+  <pre><code>curl -s http://127.0.0.1:2222/token          # must equal /tmp/rtun-www/token
+diff &lt;(curl -s http://127.0.0.1:2222/token) /tmp/rtun-www/token &amp;&amp; echo TOKEN-OK
+grep 'port=8022' serve.log                   # serve side names the target port
+kill %2 ; curl -sv http://127.0.0.1:2222/token   # expect: Connection refused</code></pre>
+
+  <p>
+    Then the SSH variant, which is the target's literal wording. Enable Remote Login first
+    (System Settings → General → Sharing, or <code>sudo systemsetup -setremotelogin on</code>), serve
+    <code>--tcp 22</code>, map <code>2222:22</code>, and run <code>ssh -p 2222 127.0.0.1 'hostname; uptime'</code>.
+  </p>
+
+  <div class="callout warn">
+    <strong>What 3.1 loses on one Mac.</strong> Its evidence requirement is "the local hostname before
+    connecting and the remote hostname inside the session" — and here they are the same string. The
+    token check above replaces that proof and is strictly stronger about the byte path, but it says
+    nothing about reaching another host. The SSH run still earns its place: it exercises an
+    interactive, latency-sensitive, bidirectional stream that <code>curl</code> does not.
+  </div>
+
+  <h3 id="t32">3.2 · Port allowlist <span class="badge auto">local</span></h3>
+
+  <pre><code>RTUN_STATE_DIR=$B $R connect $IDA --tcp 3333:9999 &gt; connect-deny.log 2&gt;&amp;1 &amp;
+curl -sv http://127.0.0.1:3333/            # must fail
+grep -i 'refus' serve.log                  # serve side names port 9999</code></pre>
+
+  <p>Full fidelity — the refusal is a comparison against <code>--tcp</code>, indifferent to topology.</p>
+
+  <h3 id="t33">3.3 · Concurrency and clean close <span class="badge auto">local</span></h3>
+
+  <pre><code># two distinct payloads that must not interleave, plus one bulk transfer
+dd if=/dev/urandom of=/tmp/rtun-www/red   bs=1m count=50
+dd if=/dev/urandom of=/tmp/rtun-www/blue  bs=1m count=50
+dd if=/dev/urandom of=/tmp/rtun-www/big   bs=1m count=100
+shasum -a 256 /tmp/rtun-www/{red,blue,big} &gt; /tmp/expected.sha
+
+curl -s http://127.0.0.1:2222/red  -o /tmp/got-red  &amp;
+curl -s http://127.0.0.1:2222/blue -o /tmp/got-blue &amp;
+wait
+curl -s http://127.0.0.1:2222/big  -o /tmp/got-big
+
+shasum -a 256 /tmp/got-{red,blue,big}      # compare against /tmp/expected.sha</code></pre>
+
+  <p>
+    Three checks in one run: the two concurrent fetches prove stream independence and that payloads
+    do not cross, and all three matching digests prove byte-exactness plus clean close — a truncated
+    or unterminated stream cannot produce a matching digest.
+  </p>
+
+  <h3 id="t34">3.4 · Repeat relayed <span class="badge auto">local</span></h3>
+
+  <pre><code># both roles with --relay-only, then rerun 3.1 and 3.3 against a 10 MB file</code></pre>
+
+  <div class="callout">
+    <strong>This is the run that matters most on one machine, and the one to shrink.</strong> Loopback
+    has no loss, no reordering and sub-millisecond RTT, so flow-control and framing bugs hide in the
+    direct run and surface in the relayed one — measured RTT through n0 was 250–350 ms. Drop the bulk
+    file to 10 MB for this pass: the n0 relay is a free shared service and 100 MB each way is not a
+    reasonable thing to push through it.
+  </div>
+
+  <h2 id="p4">P4 — UDP forwarding</h2>
+
+  <h3 id="t41">4.1 · DNS round trip <span class="badge auto">local</span></h3>
+
+  <pre><code>brew install dnsmasq
+dnsmasq -d -p 5353 --listen-address=127.0.0.1 --bind-interfaces -S 1.1.1.1 &amp;   # no sudo: port &gt; 1024
+
+RTUN_STATE_DIR=$A $R serve   --udp 5353 --allow $IDB      &gt; serve.log   2&gt;&amp;1 &amp;
+RTUN_STATE_DIR=$B $R connect $IDA --udp 5354:5353         &gt; connect.log 2&gt;&amp;1 &amp;
+dig -p 5354 @127.0.0.1 example.com</code></pre>
+
+  <p>
+    A real resolver answering a real query, all unprivileged. Pass condition is a populated ANSWER
+    section, which also proves the reply found its way back to <code>dig</code>'s ephemeral source
+    port — the session-table round trip, not just the outbound leg.
+  </p>
+
+  <h3 id="t42">4.2 · WireGuard handshake <span class="badge approval">degraded</span></h3>
+
+  <p>
+    Two <code>utun</code> interfaces on one host, each peering with the other through the tunnel, is
+    possible and not worth it: the two interfaces compete for routes to the same address space and a
+    failure is as likely to be macOS routing as rtun. What 4.2 uniquely proves beyond
+    <span class="badge id">4.1</span> is <em>sustained bidirectional datagram flow from a fixed
+    source port at close to the size cap</em>. Substitute that directly:
+  </p>
+
+  <pre><code># serve side: a UDP echo at 1000-byte datagrams
+python3 -c 'import socket;s=socket.socket(2,2);s.bind(("127.0.0.1",5353))
+while 1:
+    d,a=s.recvfrom(2048);s.sendto(d,a)' &amp;
+
+# connect side: 60 s of traffic from ONE fixed source port, count losses
+python3 -c 'import socket,time
+s=socket.socket(2,2);s.bind(("127.0.0.1",40001));s.settimeout(2);n=lost=0
+end=time.time()+60
+while time.time()&lt;end:
+    p=b"x"*1000;s.sendto(p,("127.0.0.1",5354));n+=1
+    try: s.recv(2048)
+    except socket.timeout: lost+=1
+    time.sleep(0.05)
+print(n,"sent",lost,"lost")'</code></pre>
+
+  <p>
+    Pass: loss stays near zero and the session survives the full minute without the table churning.
+    <span class="badge id">4.2</span> itself stays open — file this as
+    <code>evidence/local/4.2-substitute/</code>, and if a real WireGuard check is wanted before a
+    second machine exists, two Linux containers with <code>NET_ADMIN</code> are far easier than two
+    <code>utun</code>s (Docker is installed here but its daemon is not running).
+  </p>
+
+  <h3 id="t43">4.3 · Session reaping <span class="badge auto">local</span></h3>
+
+  <pre><code>for p in 40001 40002 40003 40004 40005; do
+  python3 -c "import socket,sys;s=socket.socket(2,2);s.bind(('127.0.0.1',int(sys.argv[1])))
+s.sendto(b'hi',('127.0.0.1',5354))" $p
+done
+grep sessions= serve.log | tail -1        # expect 5
+lsof -p $(pgrep -f 'rtun serve') -i UDP | wc -l   # independent confirmation
+sleep 75                                   # past the 60 s idle timer
+grep sessions= serve.log | tail -1        # expect 0
+lsof -p $(pgrep -f 'rtun serve') -i UDP | wc -l   # back to the baseline</code></pre>
+
+  <p>
+    Five distinct source ports must produce five distinct sessions — a single session would mean the
+    key is wrong. <code>lsof</code> is the honest cross-check: it counts sockets the kernel actually
+    holds, independently of what rtun believes.
+  </p>
+
+  <h3 id="t44">4.4 · Oversize datagram <span class="badge auto">local</span></h3>
+
+  <pre><code>python3 -c 'import socket;socket.socket(2,2).sendto(b"x"*2000,("127.0.0.1",5354))'
+grep -iE 'drop|oversiz|too large' connect.log</code></pre>
+
+  <div class="callout">
+    <strong>This check is better on one Mac than across a network.</strong> The loopback MTU is 16384,
+    so the 2000-byte datagram is accepted by the kernel without complaint. Any drop therefore comes
+    from rtun's own cap check — which is precisely the
+    <a href="implementation-plan.html">known ceiling</a> the task exists to make fail loudly. Across a
+    real network the same test could pass for the wrong reason: path MTU, not the cap.
+  </div>
+
+  <h2 id="p5">P5 — Resilience</h2>
+
+  <h3 id="t51">5.1 · Reconnect with backoff <span class="badge auto">local</span></h3>
+
+  <pre><code>kill $(pgrep -f 'rtun serve')
+sleep 180                                       # watch connect.log retry
+grep -E 'retry|reconnect|backoff' connect.log   # gaps must grow: 1s 2s 4s 8s …
+RTUN_STATE_DIR=$A $R serve --tcp 8022 --allow $IDB &gt;&gt; serve.log 2&gt;&amp;1 &amp;
+sleep 10 &amp;&amp; curl -s http://127.0.0.1:2222/token  # fresh session through the recovered link</code></pre>
+
+  <p>Full fidelity. Backoff is a timer inside one process and the far side's absence is absence either way.</p>
+
+  <h3 id="t52">5.2 · Survives a network change <span class="badge approval">degraded</span></h3>
+
+  <table>
+    <thead><tr><th>Transition</th><th>Command</th><th>Fidelity</th></tr></thead>
+    <tbody>
+      <tr><td>Wi-Fi flap / address change</td><td><code>networksetup -setairportpower en0 off; sleep 30; networksetup -setairportpower en0 on</code></td><td>Real interface loss and a new NAT mapping — but both roles lose it at once.</td></tr>
+      <tr><td>Sleep and wake</td><td><code>pmset sleepnow</code>, wake after five minutes</td><td>Real suspend, but both processes suspend together. The asymmetric case — one end sleeps while the other stays up — needs a second box.</td></tr>
+      <tr><td id="pf">Path failure mid-transfer</td><td><code>sudo pfctl -e</code> plus a rule dropping UDP to the peer's LAN address, held 60 s</td><td>The highest-value local resilience test: forces a live direct→relayed migration during a transfer. Needs admin.</td></tr>
+    </tbody>
+  </table>
+
+  <p>
+    Pass in all three: no manual restart, <code>connect.log</code> shows recovery, and a fresh token
+    fetch succeeds afterwards. Record the post-recovery path type — after a Wi-Fi flap it may come
+    back <code>relayed</code> and upgrade again, which is the design working.
+  </p>
+
+  <h3 id="t53">5.3 · 24-hour soak <span class="badge auto">local</span></h3>
+
+  <pre><code>caffeinate -s &amp;                                  # sleep would pause both roles and void the run
+while :; do
+  date -u +%FT%TZ
+  curl -s -o /dev/null -w '%{size_download} %{time_total}\n' http://127.0.0.1:2222/big
+  ps -o rss= -p $(pgrep -f 'rtun serve') $(pgrep -f 'rtun connect')
+  sleep 300
+done | tee evidence/local/5.3/soak.txt</code></pre>
+
+  <p>
+    Full fidelity, and one laptop is the honest environment for it. Pass: both processes alive at 24 h
+    and RSS flat — a session table or socket leak shows up here and nowhere else.
+  </p>
+
+  <h2 id="p6">P6 — Ship</h2>
+
+  <table>
+    <thead><tr><th>Task</th><th>Local approach</th><th>What is missing</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><span class="badge id">6.1</span></td>
+        <td><code>cargo dist build</code> for host artifacts.</td>
+        <td>The check <em>is</em> a tag push producing a release page. Off-box until a remote exists.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">6.2</span></td>
+        <td><code>sudo sysadminctl -addUser rtuntest</code>, log in, run the installer and <code>rtun id</code>.</td>
+        <td>Covers macOS only, and only if 6.1 published something to install. Linux and Windows need other machines.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">6.3</span></td>
+        <td><code>launchd</code> plist in <code>~/Library/LaunchAgents</code> for the serve role, then a real reboot.</td>
+        <td>The evidence wants "the far side's log showing reconnection" — the far side is this Mac and reboots too. Local pass is weaker: serve auto-started, and a hand-started connect reaches it.</td>
+      </tr>
+      <tr>
+        <td><span class="badge id">6.4</span></td>
+        <td>Follow the written steps literally on the fresh <code>rtuntest</code> account.</td>
+        <td>Catches path, permission and missing-step bugs. Cannot catch "obvious to the author" — that needs someone else.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2 id="substitutions">The four things one Mac cannot say</h2>
+
+  <table>
+    <thead><tr><th>Claim</th><th>Why not here</th><th>Cheapest way to get it</th></tr></thead>
+    <tbody>
+      <tr><td>Hole punching works between real NATs <span class="badge id">2.2</span></td><td>Two processes on one host have no NAT between them; the "direct" path is the LAN address.</td><td>Laptop on cellular tethering, home box on the ISP. Half a day. Still the open risk gate.</td></tr>
+      <tr><td>It runs on Linux and Windows <span class="badge id">0.2</span> <span class="badge id">6.2</span></td><td>No Windows host and no CI. Docker covers a Linux compile, not a Windows one.</td><td>A git remote plus the existing <code>ci.yml</code>. One push.</td></tr>
+      <tr><td>The far machine is a different machine <span class="badge id">1.2</span> <span class="badge id">3.1</span></td><td>One kernel, one hostname, one clock. <code>hostname</code> cannot distinguish the ends.</td><td>Any second box, or a Linux container for a different OS and netns.</td></tr>
+      <tr><td>It survives one end going away <span class="badge id">5.2</span> <span class="badge id">6.3</span></td><td>Sleep, reboot and Wi-Fi loss hit both roles simultaneously.</td><td>A second box, or the <a href="#pf">pf rule</a> as a partial stand-in for path loss.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="traps">Fake-green traps</h2>
+
+  <p>Five ways a local run passes while the tunnel is broken. Each is cheap to defend against.</p>
+
+  <div class="cards">
+    <div class="card">
+      <h3>One identity wearing two hats</h3>
+      <p>Forget <code>RTUN_STATE_DIR</code> on either role and both are the same key — the allowlist
+      trivially matches itself. The prelude's <code>IDA != IDB</code> assertion is not decoration;
+      keep it at the top of every script.</p>
+    </div>
+    <div class="card">
+      <h3>A port both sides can reach</h3>
+      <p>Both roles share one loopback, so a serve side that connected to the <em>connect</em> side's
+      socket would still answer. Never reuse a port number across roles, and keep the local mapped
+      port (2222) different from the remote one (8022).</p>
+    </div>
+    <div class="card">
+      <h3>Loopback is a perfect network</h3>
+      <p>No loss, no reordering, no RTT. Flow control, window handling and stream framing are barely
+      exercised. Every data-plane check gets a <code>--relay-only</code> repeat, which is where those
+      bugs actually appear.</p>
+    </div>
+    <div class="card">
+      <h3><code>path=direct</code> that punched nothing</h3>
+      <p>The most tempting misread in the whole plan. A local <code>direct</code> line proves the
+      reporting code works. It is not evidence for
+      <span class="badge id">2.2</span> and must never be filed as such.</p>
+    </div>
+    <div class="card">
+      <h3><code>pkill -f rtun</code> hits both roles</h3>
+      <p>Not hypothetical — it broke the first 2.3 run here. Tearing down one test's
+      <code>serve</code> by pattern killed a long-running relay hold in another shell, which then
+      logged <code>closed: timed out</code> and looked exactly like a product failure. On a one-Mac
+      rig, kill by PID. Never by pattern.</p>
+    </div>
+    <div class="card">
+      <h3>The service answering directly</h3>
+      <p><code>curl 127.0.0.1:8022</code> works with rtun dead. Always test the mapped port, and
+      always confirm it stops answering once <code>connect</code> is killed — that negative is half
+      the proof.</p>
+    </div>
+  </div>
+
+  <h2 id="observability">One thing to add before P4</h2>
+
+  <p>
+    Every check above reads existing log lines except <span class="badge id">4.3</span>, which needs a
+    session count that nothing currently exposes. The plan floats a <code>rtun status</code>
+    subcommand; the test does not need it.
+  </p>
+
+  <div class="callout">
+    <strong>Log <code>sessions=N</code> when the UDP table changes.</strong> One line on create and
+    one on reap makes 4.3 a <code>grep</code>, cross-checked by <code>lsof -i UDP</code> on the serve
+    pid. <code>rtun status</code> is a nicer product feature and a worse test hook — it needs a
+    control channel, and a log line needs nothing. Add the subcommand when a human wants to ask, not
+    because a test does.
+  </div>
+
+  <h2 id="evidence">Filing local evidence</h2>
+
+  <p>
+    The <a href="wbs.html">WBS</a> definition of done requires a real network and evidence from both
+    sides. Local runs satisfy the second and not always the first, so they need their own shelf:
+  </p>
+
+  <table>
+    <thead><tr><th>Rule</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td><code>evidence/local/&lt;task-id&gt;/</code>, never <code>evidence/&lt;task-id&gt;/</code></td><td>Keeps the ledger's meaning intact. A reader in three months must not mistake a one-Mac run for the cross-machine target.</td></tr>
+      <tr><td>First line of <code>session.txt</code> states the substitution</td><td>The WBS demands network context. Here that context is "both roles on one host, single-machine substitute", plus what the target still wants.</td></tr>
+      <tr><td>Both <code>serve.log</code> and <code>connect.log</code>, always</td><td>Unchanged from the existing convention — a one-sided log proves half a story, even when both sides are one machine.</td></tr>
+      <tr><td>Tasks marked <span class="badge auto">local</span> may be closed on local evidence</td><td>For those 12 the substitution costs nothing, so a local run is the real check and not a stand-in.</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <strong>The honest summary line for this document.</strong> One Mac can prove that rtun forwards
+    bytes correctly, refuses what it should, cleans up after itself and recovers from restarts. It
+    cannot prove the one claim that motivated v2 over
+    <a href="implementation-plan.html">v1's relay</a>. Run all of it — then keep 2.2 in front of P3
+    exactly where the WBS put it.
+  </div>
+
+  </main>
+
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    document.querySelectorAll('.diagram').forEach((d) => {
+      const pre = d.querySelector('pre.mermaid');
+      if (pre) d.dataset.mermaidSrc = pre.textContent;
+    });
+    mermaid.initialize({ startOnLoad: true, theme: 'dark', themeVariables: { darkMode: true, background: '#181b22' } });
+  </script>
+  <script type="module" src="https://htmldoc.wfomobile.com/htmldoc.js"></script>
+</body>
+</html>

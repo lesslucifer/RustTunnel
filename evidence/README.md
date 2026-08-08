@@ -4,6 +4,11 @@ Convention and definition of done live in [docs/wbs.html](../docs/wbs.html). A t
 done when the target is observably true, the check ran against real binaries, the
 evidence is filed here, and `cargo test` still passes.
 
+Runs with both roles on one machine are substitutes, not targets, and live on their own
+shelf at `evidence/local/<task-id>/` — the procedure and what each substitution costs is
+in [docs/e2e-testing.html](../docs/e2e-testing.html). Never file a local run as a
+cross-machine task's evidence.
+
 All captured runs are from `MacBook-Pro-3.local`, macOS 14.0, arm64, Wi-Fi `192.168.1.8`,
 against the public n0 relay `aps1-1.relay.n0.iroh.link`.
 

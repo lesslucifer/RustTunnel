@@ -18,7 +18,7 @@
 
   <h2 id="how-to-read">How to read this</h2>
 
-  <p>The design lives in the <a href="implementation-plan.html">implementation plan</a>. This document is the execution track: what gets built, in what order, and — the part that matters — how each piece is proven to work against a real network rather than against an assumption.</p>
+  <p>The design lives in the <a href="implementation-plan.html">implementation plan</a>. This document is the execution track: what gets built, in what order, and — the part that matters — how each piece is proven to work against a real network rather than against an assumption. The <a href="e2e-testing.html">e2e test plan</a> is the operational half: the commands for each check below, which of them run on one machine, and what each single-machine substitute costs.</p>
 
   <div class="cards" data-c="contract-cards">
     <div class="card">
@@ -31,12 +31,16 @@
     </div>
     <div class="card">
       <h3>Evidence</h3>
-      <p>A file committed under <code>evidence/&lt;task-id&gt;/</code>. If it was not captured, the task is not done — memory of a passing test is not evidence.</p>
+      <p>A file committed under <code>evidence/&lt;task-id&gt;/</code>. If it was not captured, the task is not done — memory of a passing test is not evidence. Single-machine substitutes go on their own shelf at <code>evidence/local/&lt;task-id&gt;/</code>.</p>
     </div>
   </div>
 
   <div class="callout" data-c="e2e-definition-callout">
     <strong>What "end-to-end" means here.</strong> A real <code>ssh</code>, <code>dig</code> or <code>wg</code> talking to a real service on the far machine, through two <code>rtun</code> processes, over a network path neither process controls. The five in-process cases in the plan's <a href="implementation-plan.html#testing">one check</a> are a fast regression net that runs in CI — they are necessary and they are not sufficient. Loopback cannot prove NAT traversal, because there is nothing to traverse.
+    Two <code>rtun</code> processes on one machine sit between those poles: real binaries and a real
+    QUIC connection, but one kernel and no NAT. The <a href="e2e-testing.html#coverage">coverage
+    matrix</a> rules on each task — 12 of 23 lose nothing that way, 8 are worth running as substitutes,
+    3 cannot be attempted at all.
   </div>
 
   <h3 id="evidence-convention">Evidence convention</h3>
@@ -48,6 +52,7 @@
       <tr><td>Process log</td><td><code>evidence/&lt;id&gt;/serve.log</code>, <code>connect.log</code></td><td>Both sides, with timestamps. A one-sided log proves half a story.</td></tr>
       <tr><td>Network context</td><td>first lines of <code>session.txt</code></td><td>Which two networks, and how they differ. "Both on my Wi-Fi" invalidates most of Phase 2.</td></tr>
       <tr><td>Screenshot</td><td><code>evidence/&lt;id&gt;/*.png</code></td><td>Only where text cannot carry it — a CI run page, a Windows service dialog.</td></tr>
+      <tr><td>Single-machine substitute</td><td><code>evidence/local/&lt;id&gt;/</code></td><td>Same contents, plus a first line naming the substitution and what the target still wants. Never filed as a cross-machine task's evidence — see the <a href="e2e-testing.html#evidence">filing rules</a>.</td></tr>
     </tbody>
   </table>
 
@@ -151,7 +156,7 @@ flowchart TD
         <td><span class="badge id">2.1</span></td>
         <td>Path reporting</td>
         <td>Both sides log <code>path=direct</code> or <code>path=relayed</code> on establishment, and log again when the path upgrades.</td>
-        <td>Run both roles on one machine — reports direct immediately, with no relay in between.</td>
+        <td>Run both roles on one machine — establishment is <code>relayed</code>, then <code>direct</code> is selected within a few seconds at the host's own LAN address.</td>
         <td><code>2.1/session.txt</code>.</td>
       </tr>
       <tr>
@@ -170,6 +175,15 @@ flowchart TD
       </tr>
     </tbody>
   </table>
+
+  <div class="callout" data-c="p2-timing-note">
+    <strong>2.1's check was corrected after running it.</strong> It previously read "reports direct
+    immediately, with no relay in between", which no correct implementation can satisfy: establishment
+    goes through the relay so the two sides can talk before they can talk directly, and the punch
+    upgrades the path underneath — <a href="implementation-plan.html">Hình 3</a> of the plan says so
+    explicitly. Measured on one machine, <code>direct</code> arrives 120–320 ms after
+    <code>relayed</code>. Asserting immediacy makes working code look broken.
+  </div>
 
   <div class="callout warn" data-c="p2-gate-callout">
     <strong>Gate condition.</strong> If 2.2 reports <code>relayed</code> between your two real networks, hole punching is not available to you and the entire premise of v2 is unavailable — stop and reconsider before building a data plane on it. Try a third network first, because one symmetric NAT is survivable and two are not; if it still fails, the honest options are to keep <a href="implementation-plan.html#pivot">v1's relay design</a> or to accept relayed operation and lose the latency and bandwidth argument that motivated the pivot. Do not proceed to P3 on a relayed-only result and hope.
@@ -260,8 +274,8 @@ flowchart TD
         <td><span class="badge id">5.1</span></td>
         <td>Reconnect with backoff</td>
         <td>The connecting side retries with growing delay and recovers by itself when the far side returns.</td>
-        <td>Kill <code>serve</code>, watch the retries, restart it after a few minutes, then open a fresh SSH session successfully.</td>
-        <td><code>5.1/connect.log</code> — timestamps must show the backoff growing, then a successful reconnect.</td>
+        <td>Kill <code>serve</code>, watch the retries, restart it after a few minutes, then open a fresh SSH session successfully. Separately, point <code>connect</code> at a peer that refuses it — it must give up, not retry.</td>
+        <td><code>5.1/connect.log</code> — timestamps must show the backoff growing, then a successful reconnect, plus the refusal case exiting non-zero.</td>
       </tr>
       <tr>
         <td><span class="badge id">5.2</span></td>
@@ -279,6 +293,14 @@ flowchart TD
       </tr>
     </tbody>
   </table>
+
+  <div class="callout" data-c="p5-refusal-note">
+    <strong>Reconnect must distinguish "refused" from "gone".</strong> Running 1.3 surfaced that
+    <code>connect</code> exits <code>0</code> when the allowlist turns it away — correct close code,
+    correct log line, wrong exit status. Today nothing depends on it; the moment 5.1 adds a retry loop
+    it becomes a bug that retries a permanent refusal forever. Treat
+    <code>ApplicationClosed</code> as terminal and exit non-zero, and retry everything else.
+  </div>
 
   <div class="callout warn" data-c="p5-callout">
     <strong>5.2 is where laptops actually break.</strong> Sleep and network switches are the normal operating conditions of the machine this runs on, not edge cases. A tunnel that needs a manual restart after every lid close is a tunnel nobody keeps using — which makes this the phase that decides whether the tool survives contact with daily use.
