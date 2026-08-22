@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en" data-htmldoc-id="6a89666f9f34851f0dfabcb2">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rtun — Dynamic configuration and the admin UI</title>
+</head>
+<body>
+  <header class="doc-hero">
+    <div class="inner">
+      <h1>Dynamic configuration and the admin UI</h1>
+      <p>Add and remove named peers and ports on a running tunnel, from a local web panel, without a restart and without dropping the connection.</p>
+      <div class="meta">Draft v1 · 2026-08-22 · RustTunnel</div>
+    </div>
+  </header>
+
+  <main>
+
+  <h2 id="why">What changed and why</h2>
+
+  <p>Both of rtun's allowlists used to be command-line arguments read once at startup. That made every change a restart: editing <code>--allow</code> or <code>--tcp</code> meant killing the process, which dropped every live connection and every UDP session on it. For a tool whose whole job is holding a long-lived link, "restart to add a port" is the wrong shape.</p>
+
+  <p>The allowlists are now backed by a configuration file that both roles read live, and a small authenticated web panel edits it. The tunnel keeps running while it changes.</p>
+
+  <div class="callout" data-c="promise">
+    <p><strong>The promise.</strong> A port offered at 10:00 is reachable at 10:00. A peer removed at 10:05 loses its open connection at 10:05 — not whenever it next reconnects.</p>
+  </div>
+
+  <h2 id="model">The model</h2>
+
+  <p>One file, <code>config.toml</code> in the state directory, holds both roles' settings. A change is applied by one writer path and observed by many cheap readers.</p>
+
+  <div class="diagram" data-c="flow-diagram">
+    <pre class="mermaid">
+flowchart LR
+  UI["Admin UI<br/>(browser)"] -->|"POST/PATCH/DELETE<br/>+ bearer token"| API["admin.rs<br/>HTTP API"]
+  API --> M["Shared::mutate"]
+  M --> V{"validate"}
+  V -->|"rejected"| E["422 + reason<br/><i>running config untouched</i>"]
+  V -->|"ok"| W["write config.toml<br/><i>temp file + rename</i>"]
+  W --> P["publish snapshot<br/>(watch channel)"]
+  P --> S["serve: allowlist checks<br/>+ evict revoked peers"]
+  P --> C["connect: bind / unbind<br/>local listeners"]
+    </pre>
+    <div class="caption">Hình 1 — One writer, many readers. Nothing is published until it has both validated and reached disk.</div>
+  </div>
+
+  <p>Readers hold an immutable <code>Arc&lt;Config&gt;</code> snapshot, so the per-stream and per-datagram allowlist checks stay free and never block a writer. The order in <em>validate → write → publish</em> is deliberate: what is running is always what is on disk, and a rejected or unwritable edit changes neither.</p>
+
+  <h2 id="grants">Who may reach what</h2>
+
+  <p>Grants are per peer, with a shared set for the common case. A peer reaches <code>serve.shared</code> plus its own <code>offers</code>, and only while both the peer entry and the port entry are enabled.</p>
+
+  <table data-c="grant-table">
+    <thead>
+      <tr><th>Entry</th><th>Meaning</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>serve.shared</code></td><td>Offered to every enabled peer.</td></tr>
+      <tr><td><code>serve.peers[].offers</code></td><td>Offered to that one peer. Not reachable by any other peer.</td></tr>
+      <tr><td><code>enabled = false</code></td><td>Parked: the row and its name are kept, the grant is not in force.</td></tr>
+      <tr><td><code>connect.bindings</code></td><td>Local listeners on the connecting side, <code>local → remote</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <p>Parking matters more than it looks. Deleting a peer throws away a 64-character key you would have to paste again; disabling it keeps the name and the history while removing the access. The UI offers both, and the enforcement path treats a parked entry exactly like an absent one.</p>
+
+  <div class="callout warn" data-c="parked-warning">
+    <p><strong>A parked entry is not a soft grant.</strong> <code>Config::admits</code> returns false for a disabled peer, and <code>granted()</code> returns <code>None</code> rather than an empty list — the caller cannot mistake "parked" for "allowed, but no ports".</p>
+  </div>
+
+  <h2 id="enforcement">Enforcement while running</h2>
+
+  <p>Reading the config live is only half of it. The other half is that a change must reach connections that already exist.</p>
+
+  <div class="diagram" data-c="revoke-diagram">
+    <pre class="mermaid">
+sequenceDiagram
+  participant U as Admin UI
+  participant S as serve
+  participant P as Peer (connected)
+  P->>S: QUIC connection (admitted)
+  U->>S: DELETE /api/peers
+  Note over S: watch channel fires
+  S->>P: close(code 1, "access revoked")
+  Note over P: connect exits — a refusal is permanent,<br/>so it does not retry-loop
+    </pre>
+    <div class="caption">Hình 2 — Revocation reaches a connection that is already open.</div>
+  </div>
+
+  <ul>
+    <li><strong>TCP</strong> — the port allowlist is checked per stream, so a withdrawn port refuses the next stream on an existing connection.</li>
+    <li><strong>UDP</strong> — checked per datagram, and a config change also closes sessions whose port lost its grant, because a UDP session holds an open socket to the local service.</li>
+    <li><strong>Peers</strong> — a watcher per connection closes it the moment the peer stops being admitted, whether it was removed or merely disabled.</li>
+    <li><strong>Bindings</strong> — the connecting side reconciles its listener set: new rows bind, removed rows drop (releasing the port), and a changed remote port re-points the pump without rebinding.</li>
+  </ul>
+
+  <p>A binding whose port is already in use is reported on its own row with the OS error and retried on the next change. It does not fail the process, and it does not disturb the listeners that did bind.</p>
+
+  <h2 id="security">Security of the admin surface</h2>
+
+  <p>The admin port can grant a peer access to loopback services, so it is treated as a credential-bearing surface rather than a convenience.</p>
+
+  <div class="cards" data-c="security-cards">
+    <div class="card">
+      <h3>Loopback by default</h3>
+      <p><code>--admin 7000</code> binds <code>127.0.0.1</code>. Exposing the panel requires naming an interface (<code>--admin 0.0.0.0:7000</code>) and logs a warning when you do.</p>
+    </div>
+    <div class="card">
+      <h3>Token, compared in constant time</h3>
+      <p>128 bits of CSPRNG output in <code>admin.token</code>, created <code>0600</code>. Persisted rather than regenerated so an open tab survives a restart.</p>
+    </div>
+    <div class="card">
+      <h3>Header-only mutations</h3>
+      <p>Reads accept the token in the URL so the printed link works. Writes require an <code>Authorization</code> header, which a cross-origin form cannot set.</p>
+    </div>
+    <div class="card">
+      <h3>The URL does not linger</h3>
+      <p>The page moves the token into <code>sessionStorage</code> and strips it from the address bar on load, so it stops leaking through history and bookmarks.</p>
+    </div>
+  </div>
+
+  <p>The token is as sensitive as the allowlist it edits. <strong>Anyone who holds it can grant a peer access to your loopback services.</strong></p>
+
+  <h2 id="compat">Backward compatibility</h2>
+
+  <p>Every documented invocation still works. Flags seed the config on first run: they add what is missing and never overwrite or re-enable an entry that has been edited, so re-running the same command is idempotent rather than additive.</p>
+
+  <div class="callout" data-c="compat-note">
+    <p><code>rtun serve --tcp 22 --allow $ID</code> behaves exactly as before. The one deliberate relaxation is that <code>--allow</code> is no longer unconditionally required: with <code>--admin</code>, a cold start with no peers is valid, because adding the first peer is precisely what the panel is for. Without either, the command still fails rather than starting a server nothing can reach.</p>
+  </div>
+
+  <h2 id="verification">Verification</h2>
+
+  <p>The dynamic behaviour is covered by tests that run both roles in-process on loopback and change the configuration mid-flight — the only way to check a promise about a <em>running</em> tunnel.</p>
+
+  <table data-c="test-table">
+    <thead>
+      <tr><th>Test</th><th>What would break without it</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>offering_a_port_at_runtime_makes_it_reachable</code></td><td>The core feature: refused before the edit, carrying bytes after.</td></tr>
+      <tr><td><code>withdrawing_a_port_at_runtime_refuses_new_streams</code></td><td>Removal that only applies on reconnect.</td></tr>
+      <tr><td><code>revoking_a_peer_closes_its_live_connection</code></td><td>A removed peer keeping an authorised connection — an open door.</td></tr>
+      <tr><td><code>disabling_a_peer_closes_its_live_connection</code></td><td>Parking treated as a weaker grant than removal.</td></tr>
+      <tr><td><code>adding_a_binding_at_runtime_binds_and_forwards</code></td><td>A new binding not forwarding, or reconciliation disturbing an existing one.</td></tr>
+      <tr><td><code>removing_a_binding_releases_the_local_port</code></td><td>A listener ignored but not closed, holding the port.</td></tr>
+      <tr><td><code>a_binding_can_be_parked_and_restored</code></td><td>The UI toggle losing the row or failing to rebind.</td></tr>
+      <tr><td><code>a_per_peer_grant_does_not_leak_to_another_peer</code></td><td>Per-peer scoping silently behaving as a shared grant.</td></tr>
+      <tr><td><code>mutation_applies_with_no_subscriber</code></td><td>A real bug found this way — see below.</td></tr>
+    </tbody>
+  </table>
+
+  <p>These were checked against deliberate sabotage: disabling the eviction watcher and neutering listener reconciliation failed exactly the five tests that cover those behaviours, and left the rest green. A test that cannot fail is not evidence.</p>
+
+  <div class="callout warn" data-c="watch-bug">
+    <p><strong>Bug caught during development.</strong> <code>tokio::watch::Sender::send</code> returns an error <em>and discards the value</em> when there are no subscribers. The first implementation used <code>let _ = tx.send(...)</code>, so any edit made before the data plane subscribed was silently dropped — including every edit in a process whose config is only ever touched through the UI. It is <code>send_replace</code> now, and <code>mutation_applies_with_no_subscriber</code> pins the behaviour.</p>
+  </div>
+
+  <p>Beyond the suite, the feature was exercised end to end with two real processes: both started with empty configs, were configured entirely over the HTTP API, upgraded to a direct path, carried real HTTP traffic through a port bound at runtime, then had that port withdrawn and the peer revoked — each taking effect immediately.</p>
+
+  <h2 id="ui">The panel</h2>
+
+  <p>One embedded HTML file, no build step and no framework, so <code>cargo build</code> remains the only build and the binary stays the only artifact. It shows the panel matching the running role, polls every four seconds (and not while the tab is hidden) to keep the live path and bind status honest, and reports validation errors from the server verbatim rather than guessing.</p>
+
+  <p>Motion follows the project's usual restraint: short <code>ease-out</code> transitions, press feedback on buttons, a one-time stagger on first paint, nothing entering from <code>scale(0)</code>, and <code>prefers-reduced-motion</code> dropping movement while keeping opacity.</p>
+
+  <p>See also: <a href="pairing.html">Pairing two machines</a> · <a href="implementation-plan.html">Implementation plan</a> · <a href="e2e-testing.html">E2E test plan</a></p>
+
+  </main>
+
+  <script type="module">
+    import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+    // keep diagram source readable for the diff layer (mermaid replaces it with SVG)
+    document.querySelectorAll('.diagram').forEach((d) => {
+      const pre = d.querySelector('pre.mermaid');
+      if (pre) d.dataset.mermaidSrc = pre.textContent;
+    });
+    mermaid.initialize({ startOnLoad: true, theme: 'dark', themeVariables: { darkMode: true, background: '#181b22' } });
+  </script>
+  <script type="module" src="https://htmldoc.wfomobile.com/htmldoc.js"></script>
+</body>
+</html>

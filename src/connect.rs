@@ -1,14 +1,18 @@
 //! The machine reaching the offered ports: dials by endpoint id, binds local
 //! listeners, and owns the UDP session table keyed by local source address.
+//!
+//! Listeners are keyed by (protocol, local port) and reconciled against the live
+//! configuration: adding a binding binds a socket, removing one drops it, and both
+//! happen without disturbing the QUIC connection or the other listeners.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use iroh::{
     EndpointAddr,
@@ -22,7 +26,9 @@ use tracing::{debug, info, warn};
 
 use crate::{
     PortMap,
+    config::{Binding, Proto},
     proto::{self, DATAGRAM_HEADER},
+    state::{BindState, Shared},
 };
 
 /// One buffer per local UDP listener, sized so an oversize datagram arrives whole
@@ -35,32 +41,107 @@ const UDP_BUF: usize = 65_535;
 const BACKOFF_START: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-pub async fn run(
-    ep: iroh::Endpoint,
-    peer: EndpointAddr,
-    tcp: Vec<PortMap>,
-    udp: Vec<PortMap>,
-) -> Result<()> {
+/// A bound local socket, kept across reconnects so a client reaching 2222 during
+/// an outage queues rather than finding nothing listening.
+enum Sock {
+    Tcp(Arc<TcpListener>),
+    Udp(Arc<UdpSocket>),
+}
+
+/// The set of currently bound listeners, reconciled against the config.
+#[derive(Default)]
+struct Listeners {
+    bound: HashMap<(Proto, u16), (Sock, u16)>,
+}
+
+impl Listeners {
+    /// Binds what is newly configured, drops what is gone, and retargets a binding
+    /// whose remote port changed. Returns true when the set changed, so the caller
+    /// only restarts the forwarders that way.
+    async fn reconcile(&mut self, want: &[Binding], shared: &Arc<Shared>) -> bool {
+        let mut changed = false;
+        let keys: HashSet<(Proto, u16)> = want.iter().map(|b| (b.proto, b.local)).collect();
+
+        // Dropping the Arc closes the socket and frees the port for something else.
+        let stale: Vec<_> = self.bound.keys().filter(|k| !keys.contains(k)).copied().collect();
+        for k in stale {
+            self.bound.remove(&k);
+            shared.clear_bind(k.0, k.1);
+            info!(proto = %k.0, local = k.1, "stopped listening");
+            changed = true;
+        }
+
+        for b in want {
+            let key = (b.proto, b.local);
+            // A changed remote port keeps the socket but must re-point the pump.
+            if let Some((_, remote)) = self.bound.get_mut(&key) {
+                if *remote != b.remote {
+                    *remote = b.remote;
+                    info!(proto = %b.proto, local = b.local, remote = b.remote, "retargeted");
+                    changed = true;
+                }
+                continue;
+            }
+            match bind_one(b).await {
+                Ok(sock) => {
+                    self.bound.insert(key, (sock, b.remote));
+                    shared.set_bind(b.proto, b.local, BindState::Listening);
+                    info!(proto = %b.proto, local = b.local, remote = b.remote, "listening");
+                    changed = true;
+                }
+                Err(e) => {
+                    // A port in use must not kill the process or the other
+                    // listeners: it is reported and retried on the next change.
+                    warn!(proto = %b.proto, local = b.local, "cannot bind: {e:#}");
+                    shared.set_bind(b.proto, b.local, BindState::Failed {
+                        error: format!("{e:#}"),
+                    });
+                }
+            }
+        }
+        changed
+    }
+
+    fn tcp(&self) -> Vec<(Arc<TcpListener>, PortMap)> {
+        self.bound
+            .iter()
+            .filter_map(|((_, local), (s, remote))| match s {
+                Sock::Tcp(l) => Some((l.clone(), PortMap { local: *local, remote: *remote })),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn udp(&self) -> Vec<(Arc<UdpSocket>, PortMap)> {
+        self.bound
+            .iter()
+            .filter_map(|((_, local), (s, remote))| match s {
+                Sock::Udp(u) => Some((u.clone(), PortMap { local: *local, remote: *remote })),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+async fn bind_one(b: &Binding) -> Result<Sock> {
+    let addr = (std::net::Ipv4Addr::LOCALHOST, b.local);
+    Ok(match b.proto {
+        Proto::Tcp => Sock::Tcp(Arc::new(TcpListener::bind(addr).await?)),
+        Proto::Udp => Sock::Udp(Arc::new(UdpSocket::bind(addr).await?)),
+    })
+}
+
+pub async fn run(ep: iroh::Endpoint, peer: EndpointAddr, shared: Arc<Shared>) -> Result<()> {
     println!("endpoint id {}", ep.id());
 
-    // Bound before dialing, and kept bound across reconnects: a taken local port
-    // must fail the command, and a client reaching 2222 during an outage should
-    // queue rather than find nothing listening.
-    let mut tcp_listeners = Vec::new();
-    for m in &tcp {
-        let l = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, m.local))
-            .await
-            .with_context(|| format!("binding tcp 127.0.0.1:{}", m.local))?;
-        info!(proto = "tcp", local = m.local, remote = m.remote, "listening");
-        tcp_listeners.push((Arc::new(l), *m));
-    }
-    let mut udp_sockets = Vec::new();
-    for m in &udp {
-        let s = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, m.local))
-            .await
-            .with_context(|| format!("binding udp 127.0.0.1:{}", m.local))?;
-        info!(proto = "udp", local = m.local, remote = m.remote, "listening");
-        udp_sockets.push((Arc::new(s), *m));
+    let mut listeners = Listeners::default();
+    let mut cfg_rx = shared.subscribe();
+    let initial = shared.config().active_bindings();
+    listeners.reconcile(&initial, &shared).await;
+    // A command that asked for listeners and got none is a failure worth exiting
+    // for; one that asked for none is a control-plane-only run and is fine.
+    if !initial.is_empty() && listeners.bound.is_empty() {
+        bail!("no local port could be bound; see the errors above");
     }
 
     let mut delay = BACKOFF_START;
@@ -71,10 +152,29 @@ pub async fn run(
         match ep.connect(peer.clone(), crate::ALPN).await {
             Ok(conn) => {
                 delay = BACKOFF_START; // a link that formed once earns a fresh ladder
-                crate::report_path(&conn);
-                let tasks = spawn_forwarders(&conn, &tcp_listeners, &udp_sockets);
-                let reason = conn.closed().await;
+                crate::report_path(&conn, &shared);
+                shared.peer_connected(conn.remote_id());
+
+                // Forwarders are (re)spawned whenever the listener set changes, so
+                // a binding added in the UI starts carrying traffic immediately.
+                let mut tasks = spawn_forwarders(&conn, &listeners);
+                let reason = loop {
+                    tokio::select! {
+                        reason = conn.closed() => break reason,
+                        changed = cfg_rx.changed() => {
+                            if changed.is_err() {
+                                break conn.closed().await;
+                            }
+                            let want = cfg_rx.borrow_and_update().active_bindings();
+                            if listeners.reconcile(&want, &shared).await {
+                                tasks.iter().for_each(AbortHandle::abort);
+                                tasks = spawn_forwarders(&conn, &listeners);
+                            }
+                        }
+                    }
+                };
                 tasks.iter().for_each(AbortHandle::abort);
+                shared.peer_disconnected(&peer.id);
                 // "Refused" and "gone" are different answers. The allowlist's close
                 // is a permanent no, and retrying it forever would be a busy loop
                 // against a decision that will not change.
@@ -86,7 +186,21 @@ pub async fn run(
             Err(e) => warn!(peer = %peer.id, "dial failed: {}", anyhow!("{e:#}")),
         }
         info!(peer = %peer.id, retry_in = ?delay, "retrying");
-        tokio::time::sleep(delay).await;
+        // Waiting for the retry must still service config edits, or a binding added
+        // during an outage would not appear until the peer came back.
+        let until = tokio::time::Instant::now() + delay;
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(until) => break,
+                changed = cfg_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let want = cfg_rx.borrow_and_update().active_bindings();
+                    listeners.reconcile(&want, &shared).await;
+                }
+            }
+        }
         delay = (delay * 2).min(BACKOFF_MAX);
     }
 }
@@ -94,18 +208,15 @@ pub async fn run(
 /// Everything that carries bytes for one connection, so that losing the
 /// connection tears all of it down and the next one starts clean — in particular
 /// the UDP session table, whose ids the far side forgot when the link died.
-fn spawn_forwarders(
-    conn: &Connection,
-    tcp: &[(Arc<TcpListener>, PortMap)],
-    udp: &[(Arc<UdpSocket>, PortMap)],
-) -> Vec<AbortHandle> {
+fn spawn_forwarders(conn: &Connection, listeners: &Listeners) -> Vec<AbortHandle> {
+    let (tcp, udp) = (listeners.tcp(), listeners.udp());
     let mut tasks: Vec<AbortHandle> = tcp
         .iter()
         .map(|(l, m)| tokio::spawn(accept_tcp(l.clone(), conn.clone(), *m)).abort_handle())
         .collect();
     if !udp.is_empty() {
         let sessions = Arc::new(Mutex::new(Sessions::default()));
-        for (s, m) in udp {
+        for (s, m) in &udp {
             tasks.push(
                 tokio::spawn(pump_udp_out(s.clone(), conn.clone(), *m, sessions.clone()))
                     .abort_handle(),

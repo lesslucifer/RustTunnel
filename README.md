@@ -20,6 +20,9 @@ rtun serve --tcp 22 --allow $ID_LAPTOP      rtun connect $ID_HOME --tcp 2222:22
   endpoint keys. No third party terminates TLS or sees plaintext.
 - **Two allowlists, no defaults.** Only named peers may connect, and only named
   ports may be reached. There is no "allow anyone" mode.
+- **Reconfigurable while running.** Add or remove peers and ports from a local
+  web UI (`--admin 7000`) and the change applies at once — no restart, no
+  dropped connection. See [Admin UI](#admin-ui).
 - **No root, no TUN device, no virtual IPs, no daemon required.**
 
 **What it is not:** a public ingress. An unmodified peer running plain `ssh` or
@@ -108,15 +111,20 @@ Offers local ports to allowlisted peers.
 
 | Flag | Meaning |
 | --- | --- |
-| `--allow <ENDPOINT_ID>` | Peer permitted to connect. **Required**, repeatable. |
+| `--allow <ENDPOINT_ID>` | Peer permitted to connect. Repeatable. Required unless the config already lists a peer or `--admin` is given. |
 | `--tcp <PORT>` | Local TCP port that may be reached. Repeatable. |
 | `--udp <PORT>` | Local UDP port that may be reached. Repeatable. |
+| `--admin <PORT\|IP:PORT>` | Serve the [admin UI](#admin-ui). A bare port binds loopback. |
 | `--relay-only` | Skip direct paths; force traffic through the relay. |
 
 Connections are made to `127.0.0.1` on the serving machine — `rtun` reaches
-loopback services, not other hosts on its LAN. A peer not in `--allow` is closed
-immediately; a port not in `--tcp`/`--udp` is refused per stream or per
+loopback services, not other hosts on its LAN. A peer that is not allowlisted is
+closed immediately; a port that is not offered is refused per stream or per
 datagram, with a log line naming it.
+
+Both allowlists are read live. Withdrawing a port refuses the next stream on a
+connection that is already open, and removing or disabling a peer closes its
+connection immediately rather than waiting for it to hang up.
 
 ### `rtun connect <PEER_ID>`
 
@@ -126,6 +134,7 @@ Binds local listeners and forwards them to the serving peer.
 | --- | --- |
 | `--tcp <LOCAL:REMOTE>` | Map a local TCP port onto a remote one. Repeatable. |
 | `--udp <LOCAL:REMOTE>` | Map a local UDP port onto a remote one. Repeatable. |
+| `--admin <PORT\|IP:PORT>` | Serve the [admin UI](#admin-ui). A bare port binds loopback. |
 | `--relay-only` | Skip direct paths; force traffic through the relay. |
 
 Listeners bind `127.0.0.1` only and are bound *before* dialing, so a port
@@ -134,11 +143,89 @@ across reconnects: if the link drops, `rtun` retries with a growing delay
 (1s → 30s) and clients queue instead of finding nothing listening. Being refused
 by the peer's allowlist is permanent, and exits rather than retrying forever.
 
+A binding added while `rtun` is running binds its port immediately and forwards
+over the existing connection; removing one releases the port. A binding whose
+port is already taken is reported on its own row and retried on the next change
+— it does not kill the process or disturb the other listeners.
+
+## Admin UI
+
+`--admin` serves a small web panel that edits both allowlists live:
+
+```sh
+rtun serve --admin 7000            # add/remove peers and offered ports
+rtun connect $ID_HOME --admin 7000 # add/remove local port bindings
+```
+
+On start, `rtun` prints the URL with a token:
+
+```
+admin ui http://127.0.0.1:7000/?t=f69c870e1786a24020108c6567e92c8f
+```
+
+Open it and you can name and add a peer, offer or withdraw a port, bind or
+release a local port, and park any entry with a toggle instead of deleting it.
+Every change is applied to the running process and written to `config.toml`, so
+it survives a restart.
+
+Because the UI can add the first peer, `--allow` is no longer required when
+`--admin` is given — `rtun serve --admin 7000` is a valid cold start.
+
+**Security.** The admin port grants exactly what `rtun` itself grants, so treat
+it as a credential:
+
+- A bare `--admin 7000` binds `127.0.0.1` only. Passing `IP:PORT` exposes the
+  panel deliberately and logs a warning.
+- Every request carries a token from `admin.token` in the state directory
+  (created `0600`, compared in constant time). The token in the URL is moved
+  into `sessionStorage` and stripped from the address bar on load.
+- Mutations must send the token in an `Authorization` header, which a
+  cross-origin form cannot set.
+
+### Configuration file
+
+Both roles read and write `config.toml` in the state directory. It is meant to
+be readable, and is safe to hand-edit while `rtun` is not running:
+
+```toml
+[[serve.shared]]          # reachable by every enabled peer
+proto = "tcp"
+port = 8022
+name = "test http"
+enabled = true
+
+[[serve.peers]]
+id = "3eeeccd10e72faebab6d9b23ad692a6b3f46eaa6ba8307e1b9059af4896877bf"
+name = "laptop"
+enabled = true
+
+  [[serve.peers.offers]]  # granted to this peer alone
+  proto = "tcp"
+  port = 5432
+  name = "postgres"
+  enabled = true
+
+[[connect.bindings]]      # local listeners on the connecting side
+proto = "tcp"
+local = 12345
+remote = 8022
+name = "http"
+enabled = true
+```
+
+A peer reaches `serve.shared` plus its own `offers`, and only while both the
+peer and the entry are `enabled`. `enabled = false` is how an entry is parked
+without losing its name.
+
+The command-line flags still work and seed this file on first run: they add
+what is missing and never overwrite or re-enable an entry you have edited, so
+`rtun serve --tcp 22 --allow $ID` behaves exactly as it always did.
+
 ### Environment
 
 | Variable | Effect |
 | --- | --- |
-| `RTUN_STATE_DIR` | Where `secret.key` lives. Overrides everything below. |
+| `RTUN_STATE_DIR` | Where `secret.key`, `config.toml` and `admin.token` live. Overrides everything below. |
 | `STATE_DIRECTORY` | Honoured so systemd's `StateDirectory=rtun` just works. |
 | `RTUN_LOG` | Log filter, `tracing` syntax. Default `rtun=info`; try `rtun=debug`. |
 
@@ -159,6 +246,12 @@ exchange.
 - `--allow` is the peer allowlist; `--tcp`/`--udp` are the port allowlist.
   Without the second, one allowlisted peer would reach every loopback port on
   the serving machine — a much larger grant than `--tcp 22` looks like.
+- A port may be granted to one peer only, via that peer's own `offers`. A
+  per-peer grant is not reachable by any other peer.
+- The admin port is a control plane for both allowlists. `admin.token` is
+  created `0600` and **anyone who holds it can grant a peer access to your
+  loopback services** — it is as sensitive as the allowlist itself. Keep the
+  panel on loopback unless you have a reason not to.
 - The public discovery service learns that two keys are looking for each other
   and their observed addresses. It never holds payload unless the path falls
   back to relayed, and even then the bytes are encrypted end to end.
@@ -212,11 +305,13 @@ Two roles on one machine need separate identities — give each its own
 
 Design and verification docs live in [docs/](docs/): the
 [implementation plan](docs/implementation-plan.html), the
-[work breakdown](docs/wbs.html), the [e2e test plan](docs/e2e-testing.html) and
-the per-phase results. Captured runs are filed under [evidence/](evidence/) with
-a ledger in [evidence/README.md](evidence/README.md).
+[work breakdown](docs/wbs.html), the [e2e test plan](docs/e2e-testing.html),
+[dynamic configuration](docs/dynamic-configuration.html) and the per-phase
+results. Captured runs are filed under [evidence/](evidence/) with a ledger in
+[evidence/README.md](evidence/README.md).
 
-**Status: v0.1.0.** TCP and UDP forwarding, identity, allowlists, relay
-fallback, reconnect and packaging are implemented and verified. Cross-NAT
-direct connection (evidence task 2.2) has not yet been confirmed on two
-separate networks — the ledger tracks what is outstanding and why.
+**Status: v0.2.0.** TCP and UDP forwarding, identity, allowlists, relay
+fallback, reconnect, dynamic reconfiguration with the admin UI, and packaging
+are implemented and verified. Cross-NAT direct connection (evidence task 2.2)
+has not yet been confirmed on two separate networks — the ledger tracks what is
+outstanding and why.

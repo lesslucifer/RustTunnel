@@ -1,13 +1,16 @@
 //! rtun — forwards TCP and UDP ports between two machines you own, over a
 //! direct hole-punched QUIC connection. See docs/implementation-plan.html.
 
+mod admin;
+mod config;
 mod connect;
 mod proto;
 mod serve;
+mod state;
 #[cfg(test)]
 mod tunnel;
 
-use std::{env, fs, path::PathBuf, str::FromStr};
+use std::{env, fs, path::PathBuf, str::FromStr, sync::Arc};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
@@ -38,9 +41,13 @@ enum Cmd {
         /// Local UDP port that may be reached through the tunnel (repeatable)
         #[arg(long = "udp", value_name = "PORT")]
         udp: Vec<u16>,
-        /// Endpoint id permitted to connect (repeatable)
-        #[arg(long = "allow", value_name = "ENDPOINT_ID", required = true)]
+        /// Endpoint id permitted to connect (repeatable). Required unless the
+        /// config already lists a peer or an admin UI is started to add one.
+        #[arg(long = "allow", value_name = "ENDPOINT_ID")]
         allow: Vec<EndpointId>,
+        /// Serve the admin web UI on PORT (loopback) or IP:PORT
+        #[arg(long = "admin", value_name = "PORT|IP:PORT")]
+        admin: Option<String>,
         /// Disable direct paths and force traffic through the relay
         #[arg(long)]
         relay_only: bool,
@@ -55,6 +62,9 @@ enum Cmd {
         /// UDP port mapping, local:remote (repeatable)
         #[arg(long = "udp", value_name = "LOCAL:REMOTE")]
         udp: Vec<PortMap>,
+        /// Serve the admin web UI on PORT (loopback) or IP:PORT
+        #[arg(long = "admin", value_name = "PORT|IP:PORT")]
+        admin: Option<String>,
         /// Disable direct paths and force traffic through the relay
         #[arg(long)]
         relay_only: bool,
@@ -96,7 +106,7 @@ impl std::fmt::Display for PortMap {
 /// Where the persisted secret key lives. `RTUN_STATE_DIR` overrides everything,
 /// which is also how two roles share one machine during testing; systemd's
 /// `StateDirectory=rtun` shows up as `STATE_DIRECTORY`.
-fn state_dir() -> Result<PathBuf> {
+pub fn state_dir() -> Result<PathBuf> {
     for k in ["RTUN_STATE_DIR", "STATE_DIRECTORY"] {
         if let Ok(d) = env::var(k)
             && !d.is_empty()
@@ -185,12 +195,22 @@ pub const UDP_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 /// `UDP_IDLE`. Per-session timers only matter if the table gets large.
 pub const UDP_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn log_selected(conn: &Connection, msg: &'static str) {
-    let peer = conn.remote_id().fmt_short();
+/// Logs the selected path and, so the admin UI can show the same fact without
+/// scraping the log, records it on the shared state.
+fn log_selected(conn: &Connection, shared: &Arc<state::Shared>, msg: &'static str) {
+    let id = conn.remote_id();
+    let peer = id.fmt_short();
     let paths = conn.paths();
     match paths.iter().find(|p| p.is_selected()) {
         Some(p) => {
-            info!(peer = %peer, path = %path_kind(p.remote_addr()), addr = %p.remote_addr(), rtt = ?p.rtt(), "{msg}")
+            let kind = path_kind(p.remote_addr());
+            info!(peer = %peer, path = %kind, addr = %p.remote_addr(), rtt = ?p.rtt(), "{msg}");
+            shared.peer_path(
+                id,
+                kind,
+                Some(p.remote_addr().to_string()),
+                Some(p.rtt().as_millis() as u64),
+            );
         }
         None => info!(peer = %peer, path = "pending", "{msg}"),
     }
@@ -199,9 +219,10 @@ fn log_selected(conn: &Connection, msg: &'static str) {
 /// Logs the path on establishment, on every upgrade, and once a minute while the
 /// connection is held. Direct versus relayed is the single most useful diagnostic
 /// this tool has.
-pub fn report_path(conn: &Connection) {
-    log_selected(conn, "established");
+pub fn report_path(conn: &Connection, shared: &Arc<state::Shared>) {
+    log_selected(conn, shared, "established");
     let conn = conn.clone();
+    let shared = shared.clone();
     tokio::spawn(async move {
         let mut events = conn.path_events();
         let mut tick = tokio::time::interval(PATH_HEARTBEAT);
@@ -210,12 +231,14 @@ pub fn report_path(conn: &Connection) {
             tokio::select! {
                 ev = events.next() => match ev {
                     Some(PathEvent::Selected { remote_addr, .. }) => {
-                        info!(peer = %conn.remote_id().fmt_short(), path = %path_kind(&remote_addr), addr = %remote_addr, "path selected")
+                        let kind = path_kind(&remote_addr);
+                        info!(peer = %conn.remote_id().fmt_short(), path = %kind, addr = %remote_addr, "path selected");
+                        shared.peer_path(conn.remote_id(), kind, Some(remote_addr.to_string()), None);
                     }
                     Some(_) => {}
                     None => break, // connection closed
                 },
-                _ = tick.tick() => log_selected(&conn, "still up"),
+                _ = tick.tick() => log_selected(&conn, &shared, "still up"),
             }
         }
     });
@@ -238,15 +261,72 @@ async fn main() -> Result<()> {
             println!("{}", load_or_create_key()?.public());
             Ok(())
         }
-        Cmd::Serve { tcp, udp, allow, relay_only } => {
+        Cmd::Serve { tcp, udp, allow, admin, relay_only } => {
+            let path = config::config_path()?;
+            let mut cfg = config::load(&path)?;
+            // Flags seed the file on first run and are otherwise additive, so the
+            // documented one-shot invocation keeps working unchanged while the UI
+            // owns everything after that.
+            if cfg.seed_from_flags(&allow, &tcp, &udp) {
+                config::save(&path, &cfg)?;
+                info!(path = %path.display(), "seeded config from command-line flags");
+            }
+            // The original CLI made --allow required. Keeping that as a hard
+            // requirement would defeat an admin UI whose whole job is adding the
+            // first peer, so it is required only when there is no other way in.
+            if cfg.serve.peers.is_empty() && admin.is_none() {
+                bail!(
+                    "no peers allowlisted: pass --allow <ENDPOINT_ID>, or --admin <PORT> to add one from the web UI"
+                );
+            }
+
             let ep = bind_endpoint(relay_only, vec![ALPN.to_vec()]).await?;
-            serve::run(ep, allow, serve::Offered { tcp, udp }).await
+            let shared = state::Shared::new(cfg, path, state::Role::Serve);
+            if let Some(spec) = &admin {
+                start_admin(spec, &shared, ep.id().to_string()).await?;
+            }
+            serve::run(ep, shared).await
         }
-        Cmd::Connect { peer, tcp, udp, relay_only } => {
+        Cmd::Connect { peer, tcp, udp, admin, relay_only } => {
+            let path = config::config_path()?;
+            let mut cfg = config::load(&path)?;
+            if cfg.seed_bindings(&tcp, &udp) {
+                config::save(&path, &cfg)?;
+                info!(path = %path.display(), "seeded config from command-line flags");
+            }
+            if cfg.connect.bindings.is_empty() && admin.is_none() {
+                bail!(
+                    "no local ports to bind: pass --tcp/--udp LOCAL:REMOTE, or --admin <PORT> to add one from the web UI"
+                );
+            }
+
             let ep = bind_endpoint(relay_only, vec![]).await?;
-            connect::run(ep, peer.into(), tcp, udp).await
+            let shared = state::Shared::new(cfg, path, state::Role::Connect);
+            if let Some(spec) = &admin {
+                start_admin(spec, &shared, ep.id().to_string()).await?;
+            }
+            connect::run(ep, peer.into(), shared).await
         }
     }
+}
+
+/// Binds the admin listener before the data plane starts, so a bad `--admin`
+/// argument or a port already in use fails the command immediately rather than
+/// leaving a tunnel up with no way to administer it.
+async fn start_admin(spec: &str, shared: &Arc<state::Shared>, id: String) -> Result<()> {
+    let addr = config::admin_addr(spec)?;
+    let admin = Arc::new(admin::Admin {
+        shared: shared.clone(),
+        token: config::load_or_create_token()?,
+        id,
+    });
+    let listener = admin::bind(addr).await?;
+    tokio::spawn(async move {
+        if let Err(e) = admin::serve(admin, listener).await {
+            tracing::error!("admin ui stopped: {e:#}");
+        }
+    });
+    Ok(())
 }
 
 #[cfg(test)]
