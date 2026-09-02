@@ -282,9 +282,80 @@ async function api(method, path, body) {
   return data;
 }
 
+/* Full re-render: runs on first load and after an explicit mutation (a button
+   click or a successful submit). It replaces the panel, but first stashes the
+   add-form values and puts them back, so a half-typed port or label is never
+   lost even by an unrelated mutation elsewhere on the page. */
 async function refresh() {
   state = await api("GET", "/api/state");
   render();
+}
+
+/* Background poll: fetch fresh state but never touch the DOM structure. Only
+   the small live-status cells are patched in place, so the 4s timer can never
+   wipe a field the user is typing in. */
+async function poll() {
+  try {
+    state = await api("GET", "/api/state");
+  } catch {
+    return;
+  }
+  updateLive();
+}
+
+function bindDotCls(b) {
+  const rt = b.runtime;
+  return !b.enabled ? "" : rt && rt.state === "listening" ? "ok" : rt ? "bad" : "warn";
+}
+
+function bindTitle(b) {
+  return !b.enabled ? "disabled" : b.runtime ? (b.runtime.error || b.runtime.state) : "pending";
+}
+
+/* Patch live status in place: the header line, each peer's path dot, and each
+   binding's dot and failure tag. Never touches the forms, so it is safe to run
+   on a timer. */
+function updateLive() {
+  const line = document.getElementById("peers-line");
+  if (line) {
+    const isServe = state.role === "serve";
+    const pl = isServe
+      ? `${state.live_peers.length} connected`
+      : state.live_peers.length ? "connected" : "not connected";
+    line.textContent = `${pl} · up ${fmtDur(state.uptime_secs)}`;
+  }
+  document.querySelectorAll("[data-peer]").forEach((row) => {
+    const live = state.live_peers.find((l) => l.id === row.dataset.peer);
+    const dot = row.querySelector("[data-live-dot]");
+    const tag = row.querySelector("[data-live-path]");
+    if (dot) {
+      dot.className = "dot" + (live ? (live.path === "direct" ? " ok" : " warn") : "");
+      dot.title = live
+        ? `${live.path}${live.rtt_ms != null ? " · " + live.rtt_ms + "ms" : ""}`
+        : "not connected";
+    }
+    if (tag) {
+      tag.style.display = live ? "" : "none";
+      if (live) tag.textContent = live.path;
+    }
+  });
+  document.querySelectorAll("[data-bind]").forEach((row) => {
+    const b = state.bindings.find(
+      (x) => x.proto === row.dataset.proto && String(x.local) === row.dataset.local
+    );
+    if (!b) return;
+    const dot = row.querySelector("[data-bind-dot]");
+    const err = row.querySelector("[data-bind-err]");
+    if (dot) {
+      dot.className = "dot" + (bindDotCls(b) ? " " + bindDotCls(b) : "");
+      dot.title = bindTitle(b);
+    }
+    if (err) {
+      const failed = !!(b.runtime && b.runtime.state === "failed");
+      err.style.display = failed ? "" : "none";
+      if (failed) err.textContent = b.runtime.error;
+    }
+  });
 }
 
 /* One mutation path: act, report, re-read. The server is the only source of
@@ -338,7 +409,7 @@ function offerRow(o, peerId) {
 
 function addOfferForm(peerId) {
   const scope = peerId ? { peer: peerId } : {};
-  return `<form class="add" data-act="offer-add" data-scope='${esc(JSON.stringify(scope))}'>
+  return `<form class="add" data-act="offer-add" data-key="offer-${peerId || "shared"}" data-scope='${esc(JSON.stringify(scope))}'>
     <select name="proto" aria-label="protocol"><option>tcp</option><option>udp</option></select>
     <input class="pt" type="text" name="port" placeholder="port" inputmode="numeric" required aria-label="port">
     <input class="nm" type="text" name="name" placeholder="label (optional)" aria-label="label">
@@ -353,16 +424,12 @@ function serveView() {
 
   const peers = state.peers.length
     ? state.peers.map((p) => {
-        const live = state.live_peers.find((l) => l.id === p.id);
-        const dot = live ? `<span class="dot ${live.path === "direct" ? "ok" : "warn"}"
-          title="${esc(live.path)}${live.rtt_ms != null ? " · " + live.rtt_ms + "ms" : ""}"></span>`
-          : `<span class="dot" title="not connected"></span>`;
-        return `<div class="row item ${p.enabled ? "" : "off"}" style="flex-wrap:wrap">
-          ${dot}
+        return `<div class="row item ${p.enabled ? "" : "off"}" style="flex-wrap:wrap" data-peer="${esc(p.id)}">
+          <span class="dot" data-live-dot></span>
           <b>${esc(p.name) || "unnamed"}</b>
           <code class="mono" style="color:var(--muted);font-size:12px">${esc(p.short)}</code>
           <span class="grow"></span>
-          ${live ? `<span class="tag">${esc(live.path)}</span>` : ""}
+          <span class="tag" data-live-path style="display:none"></span>
           <button class="ghost" data-act="peer-copy" data-id="${esc(p.id)}">Copy ID</button>
           <button class="ghost" data-act="peer-toggle" data-id="${esc(p.id)}" data-enabled="${p.enabled}">
             ${p.enabled ? "Disable" : "Enable"}
@@ -391,7 +458,7 @@ function serveView() {
     <h2>Peers</h2>
     <p class="hint">Only these endpoint IDs may connect. Removing or disabling one closes its live connection immediately.</p>
     <div class="card">${peers}
-      <form class="add" data-act="peer-add">
+      <form class="add" data-act="peer-add" data-key="peer-add">
         <input class="id mono" type="text" name="id" placeholder="endpoint id (64 hex characters)"
                autocomplete="off" spellcheck="false" required aria-label="endpoint id">
         <input class="nm" type="text" name="name" placeholder="label, e.g. laptop" aria-label="label">
@@ -404,17 +471,14 @@ function serveView() {
 function connectView() {
   const rows = state.bindings.length
     ? state.bindings.map((b) => {
-        const rt = b.runtime;
-        const cls = !b.enabled ? "" : rt && rt.state === "listening" ? "ok" : rt ? "bad" : "warn";
-        const title = !b.enabled ? "disabled" : rt ? (rt.error || rt.state) : "pending";
-        return `<div class="row item ${b.enabled ? "" : "off"}">
-          <span class="dot ${cls}" title="${esc(title)}"></span>
+        return `<div class="row item ${b.enabled ? "" : "off"}" data-bind data-proto="${b.proto}" data-local="${b.local}">
+          <span class="dot" data-bind-dot></span>
           ${protoTag(b.proto)}
           <b class="mono">${b.local}</b>
           <span style="color:var(--muted)">→</span>
           <b class="mono">${b.remote}</b>
           <span class="grow ellipsis">${esc(b.name) || ""}</span>
-          ${rt && rt.state === "failed" ? `<span class="tag" style="color:var(--bad);border-color:#6d3236">${esc(rt.error)}</span>` : ""}
+          <span class="tag" data-bind-err style="display:none;color:var(--bad);border-color:#6d3236"></span>
           <button class="ghost" data-act="bind-toggle" data-proto="${b.proto}" data-local="${b.local}"
                   data-enabled="${b.enabled}">${b.enabled ? "Disable" : "Enable"}</button>
           <button class="ghost danger" data-act="bind-del" data-proto="${b.proto}"
@@ -429,7 +493,7 @@ function connectView() {
     <p class="hint">Each row binds <code>127.0.0.1:local</code> on this machine and forwards it to
       <code>remote</code> on the serving peer. Adding one binds immediately — no restart.</p>
     <div class="card">${rows}
-      <form class="add" data-act="bind-add">
+      <form class="add" data-act="bind-add" data-key="bind-add">
         <select name="proto" aria-label="protocol"><option>tcp</option><option>udp</option></select>
         <input class="pt" type="text" name="local" placeholder="local" inputmode="numeric" required aria-label="local port">
         <input class="pt" type="text" name="remote" placeholder="remote" inputmode="numeric" required aria-label="remote port">
@@ -443,9 +507,16 @@ function connectView() {
 function render() {
   const app = $("#app");
   const isServe = state.role === "serve";
-  const peersLine = isServe
-    ? `${state.live_peers.length} connected`
-    : state.live_peers.length ? "connected" : "not connected";
+
+  /* Stash what the user is typing before the DOM is replaced, and put it back
+     after: an unrelated mutation elsewhere on the page must not discard a
+     half-typed port or label. */
+  const stash = new Map();
+  document.querySelectorAll("#app form.add").forEach((f) => {
+    const fv = {};
+    new FormData(f).forEach((v, k) => (fv[k] = v));
+    stash.set(f.dataset.key, fv);
+  });
 
   app.innerHTML = `
     <header>
@@ -455,7 +526,7 @@ function render() {
         <button class="ghost" data-act="copy-self">Copy</button>
       </div>
       <span class="grow"></span>
-      <div class="idline">${esc(peersLine)} · up ${fmtDur(state.uptime_secs)}</div>
+      <div class="idline" id="peers-line"></div>
     </header>
     <main class="${firstPaint ? "anim" : ""}">
       ${isServe ? serveView() : connectView()}
@@ -464,6 +535,19 @@ function render() {
       </p>
     </main>`;
   app.removeAttribute("aria-busy");
+
+  /* Put stashed values back into the rebuilt forms. */
+  stash.forEach((fv, key) => {
+    const f = app.querySelector(`form.add[data-key="${key}"]`);
+    if (!f) return;
+    Object.entries(fv).forEach(([k, v]) => {
+      const el = f.elements[k];
+      if (el && (el.tagName === "INPUT" || el.tagName === "SELECT") && v) el.value = v;
+    });
+  });
+
+  updateLive();
+
   /* Stagger is decorative and must never gate interaction; it runs once. */
   if (firstPaint) {
     app.querySelectorAll(".row.item").forEach((r, i) => {
@@ -584,9 +668,11 @@ document.addEventListener("submit", (e) => {
 
 /* Polling keeps the live path and bind status honest. 4s is slow enough to be
    invisible and fast enough that a reconnect shows up while you are still
-   looking at the page. Skipped while the tab is hidden. */
+   looking at the page. Skipped while the tab is hidden. It uses `poll()`, not
+   `refresh()`, so the DOM (and any in-progress form input) is never rebuilt by
+   the timer. */
 setInterval(() => {
-  if (document.visibilityState === "visible" && state) refresh().catch(() => {});
+  if (document.visibilityState === "visible" && state) poll();
 }, 4000);
 
 (async () => {

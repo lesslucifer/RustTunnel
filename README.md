@@ -310,7 +310,7 @@ Design and verification docs live in [docs/](docs/): the
 results. Captured runs are filed under [evidence/](evidence/) with a ledger in
 [evidence/README.md](evidence/README.md).
 
-**Status: v0.2.0.** TCP and UDP forwarding, identity, allowlists, relay
+**Status: v0.3.0.** TCP and UDP forwarding, identity, allowlists, relay
 fallback, reconnect, dynamic reconfiguration with the admin UI, and packaging
 are implemented and verified. Cross-NAT direct connection (evidence task 2.2)
 has not yet been confirmed on two separate networks — the ledger tracks what is
